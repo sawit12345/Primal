@@ -36,6 +36,7 @@ class CoreKnowledgeTransfer:
             "physics",
             "causality",
             "affordance",
+            "differ",
         ]
         self.channels: list[_CoreChannel] = []
         for name in names:

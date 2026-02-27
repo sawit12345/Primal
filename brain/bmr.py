@@ -16,6 +16,16 @@ def _kl_diag_gaussian(mean_a: np.ndarray, var_a: np.ndarray, mean_b: np.ndarray,
     return 0.5 * float(np.sum(ratio + delta - 1.0 - np.log(ratio + 1e-8)) / max(1, dim))
 
 
+def _symmetric_kl_categorical(first: np.ndarray, second: np.ndarray) -> float:
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    first = first / (np.sum(first) + 1e-12)
+    second = second / (np.sum(second) + 1e-12)
+    forward = np.sum(first * np.log((first + 1e-12) / (second + 1e-12)))
+    reverse = np.sum(second * np.log((second + 1e-12) / (first + 1e-12)))
+    return 0.5 * float(forward + reverse)
+
+
 @dataclass
 class BayesianModelReduction:
     """Prunes weak components and merges redundant components."""
@@ -51,6 +61,12 @@ class BayesianModelReduction:
                     component_i = fusion.components[i]
                     component_j = fusion.components[j]
                     kl = _kl_diag_gaussian(component_i.mean, component_i.variance, component_j.mean, component_j.variance)
+
+                    slot_i = getattr(component_i, "slot_distribution", None)
+                    slot_j = getattr(component_j, "slot_distribution", None)
+                    if slot_i is not None and slot_j is not None:
+                        kl += 0.5 * _symmetric_kl_categorical(slot_i, slot_j)
+
                     if kl < best_kl:
                         best_kl = kl
                         best_pair = (i, j)

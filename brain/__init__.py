@@ -6,6 +6,7 @@ from brain.cerebellum import CerebellarSmoother
 from brain.common_sense import CommonSenseReasoner
 from brain.core_knowledge import CoreKnowledgeTransfer
 from brain.cortical_stack import CorticalStack, Homeostasis, PFCVLPFC
+from brain.differ import DifferCoreKnowledge
 from brain.extras import NeuromodulatorySwitch, ThalamicPrecisionGate
 from brain.fluid_lattice import LatticeBoltzmannIntuition
 from brain.hemifield import BilateralHemifield
@@ -27,6 +28,7 @@ __all__ = [
     "CommonSenseReasoner",
     "CoreKnowledgeTransfer",
     "CorticalStack",
+    "DifferCoreKnowledge",
     "FreeEnergyEngine",
     "Homeostasis",
     "LatticeBoltzmannIntuition",

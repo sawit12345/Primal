@@ -34,6 +34,8 @@ def test_log_fusion_growth_and_bmr_reduction() -> None:
         fusion.update(sample)
 
     assert len(fusion.components) >= 1
+    slot_probs = fusion.slot_attention(np.ones(4, dtype=np.float64))
+    assert np.isclose(np.sum(slot_probs), 1.0)
     reducer = BayesianModelReduction(max_components=3)
     reducer.reduce(fusion)
     assert len(fusion.components) <= 3
@@ -52,3 +54,8 @@ def test_theory_theory_updates_posterior() -> None:
 
     assert np.isclose(np.sum(after), 1.0)
     assert np.linalg.norm(after - before) > 1e-6
+
+    mixed, per_hyp = ensemble.predict_multiple(state, action)
+    assert set(mixed.keys()) == {1, 2, 3}
+    assert set(per_hyp.keys()) == {1, 2, 3}
+    assert mixed[1].shape == (6,)

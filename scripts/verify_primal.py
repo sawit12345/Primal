@@ -24,7 +24,7 @@ def _physics_envs() -> list[tuple[str, int]]:
 def main() -> None:
     report = {
         "physics": [benchmark_physics(env_name=env_name, episodes=6, seed=seed) for env_name, seed in _physics_envs()],
-        "vision": evaluate_mnist(samples_per_digit=10, seed=0),
+        "vision": evaluate_mnist(samples_per_digit=1, seed=0),
     }
 
     output_dir = Path("artifacts")

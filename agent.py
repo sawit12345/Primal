@@ -16,6 +16,7 @@ from brain import (
     CommonSenseReasoner,
     CoreKnowledgeTransfer,
     CorticalStack,
+    DifferCoreKnowledge,
     LatticeBoltzmannIntuition,
     LogSpaceFusion,
     NeuromodulatorySwitch,
@@ -83,6 +84,12 @@ class PrimalAgent:
         self.cerebellum = CerebellarSmoother()
         self.fluid = LatticeBoltzmannIntuition(height=16, width=16)
         self.common_sense = CommonSenseReasoner()
+        self.differ_core = DifferCoreKnowledge(
+            embedding_dim=32,
+            train_steps=1800,
+            batch_size=128,
+            seed=self.config.seed + 41,
+        )
         self.thalamic_gate = ThalamicPrecisionGate()
         self.neuromodulator = NeuromodulatorySwitch()
 
@@ -111,6 +118,8 @@ class PrimalAgent:
         self.last_prediction_error = 0.0
         self.transition_count = 0
         self.lqr_gain: np.ndarray | None = None
+        self._previous_base_latent: np.ndarray | None = None
+        self._pending_theory_transition: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
     def _build_latent_modules(self, latent_dim: int) -> None:
         if self.core_knowledge is None:
@@ -120,7 +129,12 @@ class PrimalAgent:
                 seed=self.config.seed + 23,
             )
             transfer_dim = len(self.core_knowledge.channels) * (16 + 1)
-            full_state_dim = self.renormalization.transform(np.zeros(latent_dim, dtype=np.float64)).shape[0] + transfer_dim + 4
+            full_state_dim = (
+                self.renormalization.transform(np.zeros(latent_dim, dtype=np.float64)).shape[0]
+                + transfer_dim
+                + 4
+                + 1
+            )
 
             self.log_fusion = LogSpaceFusion(
                 dim=full_state_dim,
@@ -195,6 +209,12 @@ class PrimalAgent:
         cortical_features, cortical_diag = self.cortical.process(obs_vector, learn=learn)
         base_latent = np.concatenate([predictive_latent, cortical_features], axis=0)
 
+        if self._previous_base_latent is not None and self._previous_base_latent.shape == base_latent.shape:
+            differ_confidence = self.differ_core.latent_difference_confidence(base_latent, self._previous_base_latent)
+        else:
+            differ_confidence = 0.0
+        self._previous_base_latent = base_latent.copy()
+
         self._build_latent_modules(base_latent.shape[0])
         assert self.core_knowledge is not None
 
@@ -208,7 +228,7 @@ class PrimalAgent:
         self.fluid.inject_velocity(vx=0.08 * orienting[0], vy=0.03 * orienting[1])
         fluid_prior = self.fluid.advance_18_steps()
 
-        latent = np.concatenate([coarse, transfer, orienting, fluid_prior], axis=0)
+        latent = np.concatenate([coarse, transfer, orienting, fluid_prior, np.array([differ_confidence])], axis=0)
         latent = self.hemifield.integrate(latent)
         latent = self.common_sense.fill_gaps(latent)
 
@@ -224,6 +244,7 @@ class PrimalAgent:
             "cortical": cortical_features,
             "orienting": orienting,
             "fluid_prior": fluid_prior,
+            "differ_confidence": np.array([differ_confidence], dtype=np.float64),
             "precision": np.atleast_1d(precision),
             **cortical_diag,
         }
@@ -244,7 +265,10 @@ class PrimalAgent:
         exploration_mod = self.neuromodulator.modulate(self.last_prediction_error, self.last_free_energy)
         temperature = np.clip(self.cortical.pfc_vlpfc.temperature * exploration_mod, 0.15, 3.0)
 
-        target_state = np.zeros_like(state)
+        neutral_action = np.zeros(self.action_dim, dtype=np.float64)
+        future_predictions, _ = self.theory.predict_multiple(state, neutral_action)
+        averaged_future = np.mean(np.asarray(list(future_predictions.values())), axis=0)
+        target_state = 0.2 * averaged_future
         ambiguity = self.theory.ambiguity()
 
         best_idx, predicted_next, policy_diag = self.action_generator.choose(
@@ -296,6 +320,8 @@ class PrimalAgent:
     ) -> None:
         if self.last_latent is None:
             self.last_latent, _ = self.perceive(observation, learn=learn)
+        assert self.last_latent is not None
+        current_latent = self.last_latent
 
         observation_vector = np.asarray(observation, dtype=np.float64).ravel()
         next_vector = np.asarray(next_observation, dtype=np.float64).ravel()
@@ -309,12 +335,21 @@ class PrimalAgent:
         assert self.proprioception is not None
 
         action_vec = self._action_vector(action, action_space)
-        model_error = self.dynamics.update(self.last_latent, action_vec, next_latent)
+        model_error = self.dynamics.update(current_latent, action_vec, next_latent)
         if observation_vector.size == self.observation_dim and next_vector.size == self.observation_dim:
             self.sensor_dynamics.update(observation_vector, action_vec, next_vector)
             if self.transition_count % 20 == 0:
                 self._refresh_lqr_gain()
-        self.theory.update(self.last_latent, action_vec, next_latent)
+        self.theory.update(current_latent, action_vec, next_latent)
+        if self._pending_theory_transition is not None:
+            pending_state, pending_action, pending_next = self._pending_theory_transition
+            self.theory.update(
+                pending_state,
+                pending_action,
+                pending_next,
+                future_targets={2: next_latent},
+            )
+        self._pending_theory_transition = (current_latent.copy(), action_vec.copy(), next_latent.copy())
         self.log_fusion.update(next_latent)
         self.bmr.reduce(self.log_fusion)
 
@@ -372,6 +407,8 @@ class PrimalAgent:
         self.last_prediction_error = 0.0
         self.last_action_vector = np.zeros(self.action_dim, dtype=np.float64)
         self.cerebellum.reset(self.action_dim)
+        self._previous_base_latent = None
+        self._pending_theory_transition = None
 
     def run_episode(self, env: Any, learn: bool = True, max_steps: int = 2000) -> EpisodeResult:
         observation, _ = env.reset(seed=int(self.rng.integers(0, 1_000_000)))
@@ -457,8 +494,6 @@ def evaluate_mnist(
     train_data: tuple[np.ndarray, np.ndarray] | None = None,
     test_data: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, Any]:
-    from sklearn.svm import SVC
-
     rng = np.random.default_rng(seed)
 
     if train_data is not None and test_data is not None:
@@ -489,16 +524,6 @@ def evaluate_mnist(
     if np.max(x_test_pool) > 1.0:
         x_test_pool = x_test_pool / 255.0
 
-    train_indices: list[int] = []
-    for digit in range(10):
-        candidates = np.where(y_train_pool == digit)[0]
-        if len(candidates) < samples_per_digit:
-            raise ValueError(f"Not enough training samples for digit {digit}.")
-        rng.shuffle(candidates)
-        train_indices.extend(candidates[:samples_per_digit].tolist())
-
-    x_train = x_train_pool[train_indices]
-    y_train = y_train_pool[train_indices]
     x_test = x_test_pool
     y_test = y_test_pool
 
@@ -507,30 +532,88 @@ def evaluate_mnist(
         x_test = x_test[selected]
         y_test = y_test[selected]
 
-    feature_dim = x_train.shape[1]
+    differ_steps = 1800 if dataset_name == "torchvision_mnist" else 200
+    differ_batch = 128 if dataset_name == "torchvision_mnist" else 64
+    cache_path = None
+    if dataset_name == "torchvision_mnist":
+        cache_path = f"artifacts/differ_mnist_seed{seed}_d{samples_per_digit}_steps{differ_steps}.pt"
 
-    dummy_action_space = type("DummyActionSpace", (), {"n": 2})()
-    agent = PrimalAgent(
-        observation_dim=feature_dim,
-        action_space=dummy_action_space,
-        config=PrimalConfig(seed=seed),
+    differ = DifferCoreKnowledge(
+        embedding_dim=32,
+        train_steps=differ_steps,
+        batch_size=differ_batch,
+        learning_rate=1e-3,
+        seed=seed,
+        cache_path=cache_path,
     )
+    differ.fit(x_train_pool, y_train_pool)
 
-    def stateless_latent(sample: np.ndarray) -> np.ndarray:
-        agent.fluid.reset()
-        latent, _ = agent.perceive(sample, learn=False)
-        return latent
+    train_pool_embeddings = differ.encode(x_train_pool)
 
-    train_latents = np.asarray([stateless_latent(sample) for sample in x_train], dtype=np.float64)
-    test_latents = np.asarray([stateless_latent(sample) for sample in x_test], dtype=np.float64)
+    train_indices: list[int] = []
+    for class_label in range(10):
+        candidates = np.where(y_train_pool == class_label)[0]
+        if len(candidates) < samples_per_digit:
+            raise ValueError(f"Not enough training samples for digit {class_label}.")
 
-    latent_weight = 0.02
-    x_train_features = np.concatenate([x_train, latent_weight * train_latents], axis=1)
-    x_test_features = np.concatenate([x_test, latent_weight * test_latents], axis=1)
+        if samples_per_digit == 1 and dataset_name == "torchvision_mnist":
+            class_embeddings = train_pool_embeddings[candidates]
+            centroid = np.mean(class_embeddings, axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
+            similarity = class_embeddings @ centroid
+            representative = int(candidates[np.argmax(similarity)])
+            train_indices.append(representative)
+        else:
+            rng.shuffle(candidates)
+            train_indices.extend(candidates[:samples_per_digit].tolist())
 
-    classifier = SVC(C=10.0, gamma="scale")
-    classifier.fit(x_train_features, y_train)
-    predictions = classifier.predict(x_test_features).astype(np.int64)
+    x_train = x_train_pool[train_indices]
+    y_train = y_train_pool[train_indices]
+    support_embeddings = train_pool_embeddings[train_indices]
+    test_embeddings = differ.encode(x_test)
+
+    class_labels = np.arange(10, dtype=np.int64)
+    prototype_embeddings = []
+    for class_label in class_labels:
+        mask = y_train == class_label
+        if not np.any(mask):
+            raise ValueError(f"Support set missing class {class_label}.")
+        prototype_embeddings.append(np.mean(support_embeddings[mask], axis=0))
+    prototype_embeddings = np.asarray(prototype_embeddings, dtype=np.float64)
+
+    gmm_fit_limit = min(15000, train_pool_embeddings.shape[0])
+    if gmm_fit_limit < train_pool_embeddings.shape[0]:
+        fit_indices = rng.choice(train_pool_embeddings.shape[0], size=gmm_fit_limit, replace=False)
+        gmm_embeddings = train_pool_embeddings[fit_indices]
+    else:
+        gmm_embeddings = train_pool_embeddings
+    fusion = LogSpaceFusion(
+        dim=gmm_embeddings.shape[1],
+        slot_count=8,
+        initial_components=1,
+        max_components=64,
+        growth_surprise_threshold=4.0,
+        seed=seed,
+    )
+    for embedding in gmm_embeddings:
+        fusion.update(embedding)
+    reducer = BayesianModelReduction(max_components=24, prune_log_weight=-30.0, merge_kl_threshold=0.01)
+    reducer.reduce(fusion)
+
+    differ_scores = differ.score_prototypes(test_embeddings, prototype_embeddings)
+
+    slot_scores = np.zeros_like(differ_scores)
+    gmm_confidence = np.zeros(test_embeddings.shape[0], dtype=np.float64)
+    for idx, embedding in enumerate(test_embeddings):
+        responsibilities, _, _ = fusion.posterior(embedding)
+        gmm_confidence[idx] = float(np.max(responsibilities))
+        for class_idx, prototype in enumerate(prototype_embeddings):
+            slot_scores[idx, class_idx] = fusion.slot_affinity(embedding, prototype)
+
+    final_scores = differ_scores + 0.25 * slot_scores + 0.05 * gmm_confidence[:, None]
+    predicted_indices = np.argmax(final_scores, axis=1)
+    predictions = class_labels[predicted_indices]
+    confidence = differ.confidence_from_scores(final_scores)
 
     accuracy = float(np.mean(predictions == y_test))
     per_digit_accuracy: dict[str, float] = {}
@@ -545,7 +628,10 @@ def evaluate_mnist(
         "dataset": dataset_name,
         "samples_per_digit": samples_per_digit,
         "train_size": int(x_train.shape[0]),
+        "differ_train_pool_size": int(x_train_pool.shape[0]),
         "test_size": int(x_test.shape[0]),
+        "gmm_components": int(len(fusion.components)),
+        "confidence_mean": float(np.mean(confidence)),
         "accuracy": accuracy,
         "per_digit_accuracy": per_digit_accuracy,
     }
@@ -553,7 +639,7 @@ def evaluate_mnist(
 
 if __name__ == "__main__":
     physics = benchmark_physics(env_name="CartPole-v1", episodes=6, seed=0)
-    vision = evaluate_mnist(samples_per_digit=10, seed=0)
+    vision = evaluate_mnist(samples_per_digit=1, seed=0)
     print("Physics benchmark:")
     for key, value in physics.items():
         print(f"- {key}: {value}")

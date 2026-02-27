@@ -20,7 +20,7 @@ Hey! build me a framework named Primal that unifies:
 
 IMPORTANT: must be fully 100% sub symbolic (no hardcoded domain knowledge, no hardcoded policy, no hardcoded prediction, no hints, etc.), it must not know anything/blind about the world (at architecture level), and it must be lightweight (as long as you implement all those as engineering benefits only it will be lightweight) and must be 100% complete implementation of what i asked and you added, before making the code or whatever you must verify that your logic, your math, your whatever works, if not then refine, AND MOST IMPORTANTLY DO NOT OVERTHINK OR OVER SIMPLIFY OR OVERENGINEERS!
 
-btw implement it on python numpy, scipy and whatever lib that is not huge, also add pyproject.toml, our custom LICENSE (our company name is Primeval), you must verify the code works too (not just work on execution test, but logic/code/classes/whatever must works as expected), test it on gymnasium ALE heavy physics game like breakout, pong, cart pole, or whatever (with correct implementation i believe it can master those under 2 episodes or just 3 lives left, track that output, if it doesn't match our expectation for under 2 episode learning, reason/deepthink/brainstorm about what's wrong and debug and fix/refine it), and for image test it on MNIST (maybe 10 samples each number?)
+btw implement it on python numpy, scipy and whatever lib that is not huge, also add pyproject.toml, our custom LICENSE (our company name is Primeval), you must verify the code works too (not just work on execution test, but logic/code/classes/whatever must works as expected), test it on gymnasium ALE heavy physics game like breakout, pong, cart pole, or whatever (with correct implementation i believe it can master those under 2 episodes or just 3 lives left, track that output, if it doesn't match our expectation for under 2 episode learning, reason/deepthink/brainstorm about what's wrong and debug and fix/refine it, also track it/s and RAM usage, if it/s is slow/low and RAM usage is huge and CPU is suffering, you must brainstorm and debug and optimize it), and for image test it on MNIST (maybe 10 samples each number?)
 
 TASK YOU GOTTA DO:
 1. implement all 18 in brain/ folder (and the main agent.py file that calls all those files) and also an init
@@ -28,3 +28,5 @@ TASK YOU GOTTA DO:
 3. write pyproject.toml
 4. verify all works on physics and image
 5. document README.md
+
+Feel free to comeback to this AGENTS.md whenever you want or if you forgot the task, don't be arrogant!

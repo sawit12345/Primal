@@ -11,7 +11,7 @@ Each AGENTS.md requirement is implemented as a dedicated module and wired throug
 1. Active inference core (free-energy objective, predictive coding, action generation): `brain/active_inference.py`
 2. Slot-centric Gaussian Mixture growing engine with log-space fusion: `brain/log_fusion.py`
 3. Core knowledge + transfer substrate (Spelke channels + Differ channel): `brain/core_knowledge.py`
-4. Differentiation confidence engine (Siamese-like behavior without hardcoded policy): `brain/differ.py`
+4. Universal equation-based Differ core knowledge (non-deep, modality-agnostic differentiation confidence): `brain/differ.py`
 5. Theory Theory multi-hypothesis and multi-horizon predictions: `brain/theory_theory.py`
 6. Bayesian model reduction merge/prune: `brain/bmr.py`
 7. PFC/VLPFC, retina, visual cortex, ATL, hippocampus, homeostasis: `brain/cortical_stack.py`
@@ -56,15 +56,15 @@ pytest
 From `artifacts/verification_report.json`:
 
 - Physics (Gymnasium `CartPole-v1`, 6 episodes, two seeds):
-  - Seed 0 episode rewards: `[55, 500, 500, 500, 500, 500]`
+  - Seed 0 episode rewards: `[53, 500, 500, 500, 500, 500]`
   - Seed 1 episode rewards: `[51, 500, 500, 500, 500, 500]`
   - Mastery reached by episode 2 in both runs
-  - Throughput: about `18-21 steps/s`
+  - Throughput: about `14-16 steps/s`
   - RAM footprint: about `121-130 MB`
 - Image benchmark (`1` train sample per digit, full `10,000` MNIST test set, no augmentation or synthetic transforms):
   - Dataset source: `torchvision_mnist`
-  - GMM grown components after BMR: `15`
-  - Accuracy: `0.9828`
+  - GMM grown components after BMR: `18`
+  - Accuracy: `0.9264`
 
 ## Minimal Usage Example
 

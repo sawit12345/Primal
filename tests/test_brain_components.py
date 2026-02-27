@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from brain.bmr import BayesianModelReduction
+from brain.differ import DifferCoreKnowledge
 from brain.fluid_lattice import LatticeBoltzmannIntuition
 from brain.log_fusion import LogSpaceFusion
 from brain.temporal_decay import MarkovTemporalDecay
@@ -59,3 +60,19 @@ def test_theory_theory_updates_posterior() -> None:
     assert set(mixed.keys()) == {1, 2, 3}
     assert set(per_hyp.keys()) == {1, 2, 3}
     assert mixed[1].shape == (6,)
+
+
+def test_differ_universal_mode_handles_non_image_vectors() -> None:
+    differ = DifferCoreKnowledge(embedding_dim=12, seed=0)
+    rng = np.random.default_rng(0)
+    vectors = rng.normal(size=(64, 17))
+    labels = np.arange(64) % 4
+
+    differ.fit(vectors, labels)
+    embeddings = differ.encode(vectors)
+    probe_embedding, probe_confidence, probe_scores = differ.differentiate(vectors[0], learn=True)
+
+    assert embeddings.shape == (64, 12)
+    assert probe_embedding.shape == (12,)
+    assert 0.0 <= probe_confidence <= 1.0
+    assert probe_scores.shape[0] == differ.online_slots

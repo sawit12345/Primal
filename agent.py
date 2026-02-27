@@ -84,12 +84,7 @@ class PrimalAgent:
         self.cerebellum = CerebellarSmoother()
         self.fluid = LatticeBoltzmannIntuition(height=16, width=16)
         self.common_sense = CommonSenseReasoner()
-        self.differ_core = DifferCoreKnowledge(
-            embedding_dim=32,
-            train_steps=1800,
-            batch_size=128,
-            seed=self.config.seed + 41,
-        )
+        self.differ_core = DifferCoreKnowledge(embedding_dim=32, seed=self.config.seed + 41)
         self.thalamic_gate = ThalamicPrecisionGate()
         self.neuromodulator = NeuromodulatorySwitch()
 
@@ -116,6 +111,7 @@ class PrimalAgent:
         self.last_action_vector = np.zeros(self.action_dim, dtype=np.float64)
         self.last_free_energy = 0.0
         self.last_prediction_error = 0.0
+        self.last_differ_confidence = 0.0
         self.transition_count = 0
         self.lqr_gain: np.ndarray | None = None
         self._previous_base_latent: np.ndarray | None = None
@@ -209,10 +205,15 @@ class PrimalAgent:
         cortical_features, cortical_diag = self.cortical.process(obs_vector, learn=learn)
         base_latent = np.concatenate([predictive_latent, cortical_features], axis=0)
 
+        _, differentiability_confidence, differ_scores = self.differ_core.differentiate(base_latent, learn=learn)
+
         if self._previous_base_latent is not None and self._previous_base_latent.shape == base_latent.shape:
-            differ_confidence = self.differ_core.latent_difference_confidence(base_latent, self._previous_base_latent)
+            temporal_differ = self.differ_core.latent_difference_confidence(base_latent, self._previous_base_latent)
         else:
-            differ_confidence = 0.0
+            temporal_differ = 0.0
+
+        differ_confidence = 0.6 * differentiability_confidence + 0.4 * temporal_differ
+        self.last_differ_confidence = float(differ_confidence)
         self._previous_base_latent = base_latent.copy()
 
         self._build_latent_modules(base_latent.shape[0])
@@ -245,6 +246,7 @@ class PrimalAgent:
             "orienting": orienting,
             "fluid_prior": fluid_prior,
             "differ_confidence": np.array([differ_confidence], dtype=np.float64),
+            "differ_slot_peak": np.array([float(np.max(differ_scores))], dtype=np.float64),
             "precision": np.atleast_1d(precision),
             **cortical_diag,
         }
@@ -263,7 +265,8 @@ class PrimalAgent:
         homeostatic_error = self.cortical.homeostasis.error()
         urgency_alpha = self.survival.alpha(homeostatic_error)
         exploration_mod = self.neuromodulator.modulate(self.last_prediction_error, self.last_free_energy)
-        temperature = np.clip(self.cortical.pfc_vlpfc.temperature * exploration_mod, 0.15, 3.0)
+        differ_modulation = 1.15 - 0.35 * self.last_differ_confidence
+        temperature = np.clip(self.cortical.pfc_vlpfc.temperature * exploration_mod * differ_modulation, 0.15, 3.0)
 
         neutral_action = np.zeros(self.action_dim, dtype=np.float64)
         future_predictions, _ = self.theory.predict_multiple(state, neutral_action)
@@ -405,6 +408,7 @@ class PrimalAgent:
         self.last_observation_raw = None
         self.last_free_energy = 0.0
         self.last_prediction_error = 0.0
+        self.last_differ_confidence = 0.0
         self.last_action_vector = np.zeros(self.action_dim, dtype=np.float64)
         self.cerebellum.reset(self.action_dim)
         self._previous_base_latent = None
@@ -532,19 +536,10 @@ def evaluate_mnist(
         x_test = x_test[selected]
         y_test = y_test[selected]
 
-    differ_steps = 1800 if dataset_name == "torchvision_mnist" else 200
-    differ_batch = 128 if dataset_name == "torchvision_mnist" else 64
-    cache_path = None
-    if dataset_name == "torchvision_mnist":
-        cache_path = f"artifacts/differ_mnist_seed{seed}_d{samples_per_digit}_steps{differ_steps}.pt"
-
     differ = DifferCoreKnowledge(
         embedding_dim=32,
-        train_steps=differ_steps,
-        batch_size=differ_batch,
-        learning_rate=1e-3,
+        ridge=1e-3,
         seed=seed,
-        cache_path=cache_path,
     )
     differ.fit(x_train_pool, y_train_pool)
 

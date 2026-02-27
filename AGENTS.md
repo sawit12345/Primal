@@ -4,7 +4,7 @@ Hey! build me a framework named Primal that unifies:
 3. Core Knowledge and Transfer learning for super duper fast learning(Spelke's objects, space andgeometry, number, agents, and physics, and you can add any other you would like to, but the main is Spelke's one)
 4. Theory Theory (just take the main idea of multiple beliefs/hypotheses based on current context and prediction and selection instead of using full VI)
 5. BMR for merge/prune components
-6. PFC and VLPFC (can change temperatures based on prediction errors/FE), Retinas, visual cortex, anterial temporal lobe, Hippocampus/Hippocampal, Hemisphere and bilateral Hemifield split, and other brain mechanism or components you would like to add to make it really good learners (note: don't do the full computation of what brain does, instead we just take the output/simplest how it works function, because we just want the engineering benefit without the actual work brain does while still keeping full benefit)
+6. PFC and VLPFC (can change temperatures based on prediction errors/FE), Retinas, homeostatis, visual cortex, anterial temporal lobe, Hippocampus/Hippocampal, Hemisphere and bilateral Hemifield split, and other brain mechanism or components you would like to add to make it really good learners (note: don't do the full computation of what brain does, instead we just take the output/simplest how it works function, because we just want the engineering benefit without the actual work brain does while still keeping full benefit)
 7. cerebellar smoothing for motor output
 8. Weber-Fechner logarithmic ANS precision scaling
 9. Superior Colliculus
@@ -15,7 +15,7 @@ Hey! build me a framework named Primal that unifies:
 14. propriorception for body awarness as a continuous Gaussian
 15. Markovian temporal decay on prior belief (0.7 old + 0.3 new)
 16. Renormalization Group
-17. Common Sense Reasoning
+17. Common Sense Reasoning (filling the gaps)
 18. and more you would like to add (brainstorm it)
 
 IMPORTANT: must be fully 100% sub symbolic (no hardcoded domain knowledge, no hardcoded policy, no hardcoded prediction, no hints, etc.), it must not know anything/blind about the world (at architecture level), and it must be lightweight (as long as you implement all those as engineering benefits only it will be lightweight) and must be 100% complete implementation of what i asked and you added, before making the code or whatever you must verify that your logic, your math, your whatever works, if not then refine, AND MOST IMPORTANTLY DO NOT OVERTHINK OR OVER SIMPLIFY OR OVERENGINEERS!

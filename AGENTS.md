@@ -19,6 +19,124 @@ The output must:
 
 ---
 
+## WARNING: READ THIS BEFORE WRITING A SINGLE LINE OF CODE
+
+The previous attempt at this task failed because the agent:
+- Wrote thin stub modules (total codebase under 2000 lines for 20 modules)
+- Accepted score=0.0 in Breakout as a pass because FE was decreasing
+- Accepted entropy=0.000 as "the agent became decisive" instead of recognizing it as action collapse
+- Moved to the next phase without meeting the current phase's hard criteria
+- Got blocked on a pandas dependency for MNIST and did not use the fallback
+
+Do not repeat these mistakes.
+
+**Score=0.0 in Breakout means the paddle never touched the ball. That is not learning. The target is >= 30, not > 0. Fix it before moving on.**
+
+**Entropy=0.000 means the agent picks the same action every single step. That is a bug, not a sign of learning. Entropy collapse means action generation is broken: either the temperature is near zero, the GMM is producing identical predictions for all actions, or the cerebellar smoothing has locked onto one action. Fix it before moving on.**
+
+**If your total brain/ folder is under 1500 lines, you have not implemented all 19 modules. Count the lines. Audit each file.**
+
+**If MNIST fails due to pandas, use the urllib fallback in the Definition of Done section. Do not skip MNIST.**
+
+The Definition of Done section at the bottom of this file has a checklist. Run through it before claiming the task is complete.
+
+---
+
+## ANTI-LAZINESS RULES
+
+These rules exist because the previous attempt produced stubs, skipped tests, and called score=0 a success. Read them now.
+
+### Rule 1: No stub functions
+
+Every function must do the actual work. No exceptions.
+
+```python
+# FORBIDDEN - this is a stub:
+def update_gmm(self, obs):
+    pass
+
+# FORBIDDEN - this is a stub with a return:
+def compute_fe(self, obs):
+    return 0.0
+
+# FORBIDDEN - this is a TODO:
+def e_step(self, obs):
+    # TODO: implement log-space E-step
+    return np.ones(self.n_components) / self.n_components
+
+# REQUIRED - this is an implementation:
+def e_step(self, obs):
+    log_resp = np.array([
+        self.log_pi[k] + self._log_gaussian(obs, self.mu[k], self.Sigma_inv[k], self.log_det_Sigma[k])
+        for k in range(self.n_components)
+    ])
+    log_resp -= scipy.special.logsumexp(log_resp)
+    return np.exp(log_resp)
+```
+
+If you write a stub and move on, you are not implementing the framework. You are writing a skeleton that will fail every test and produce score=0 in Breakout.
+
+### Rule 2: Count your lines before moving to the next phase
+
+After implementing each module, run `wc -l primal/brain/<module>.py`. If it is below the minimum for that module, you are not done with it. Go back.
+
+Do not batch-verify at the end. Check each module as you finish it.
+
+### Rule 3: Every brain module must be independently testable
+
+After writing each file, write a quick `if __name__ == "__main__"` block at the bottom that runs a sanity check on that module with synthetic data and prints a PASS or FAIL. This is not the Phase 5 test suite, it is a fast individual module check.
+
+Example for `log_space_gmm.py`:
+```python
+if __name__ == "__main__":
+    import numpy as np
+    gmm = LogSpaceGMM(feature_dim=4, max_components=10)
+    obs = np.random.randn(4)
+    fe_before = gmm.compute_fe(obs)
+    gmm.update(obs)
+    fe_after = gmm.compute_fe(obs)
+    assert fe_after < fe_before, f"FE did not decrease: {fe_before:.4f} -> {fe_after:.4f}"
+    print("PASS: GMM update decreases FE on seen observation")
+```
+
+If this check fails after you write the module, the module is broken. Fix it before writing the next one.
+
+### Rule 4: Do not move phases when a phase has unresolved failures
+
+The phase gate is a hard wall, not a suggestion. If Phase 5 logic tests have 3 failures, you do not run Breakout. You fix the 3 failures first. If you start running Breakout before all 15 tests pass, you are wasting time: the broken module will cause random behavior in the game and you will debug the wrong thing.
+
+### Rule 5: Breakout score < 30 is not a partial success
+
+Score of 5, 10, or 15 with no upward trend from episode 1 is not "getting closer." It is a broken action pipeline with occasional noise. Do not accept it. Do not write README. Fix the action pipeline.
+
+The specific failure mode to check: if score is in the range 1-15 but not improving, print paddle_alignment. If alignment is below 0.4, the agent is not tracking the ball. The visual streams M-path is not feeding ball position into action selection correctly.
+
+### Rule 6: All printed results must come from actual execution
+
+Do not write print statements that output hardcoded expected values. Every number printed must come from actually running the code.
+
+```python
+# FORBIDDEN:
+print("PASS: ep2 score >= 30")  # hardcoded, not from actual game run
+
+# REQUIRED:
+ep2_score = run_episode(agent, env)
+status = "PASS" if ep2_score >= 30 else "FAIL"
+print(f"{status}: ep2 score = {ep2_score:.1f} (need >= 30)")
+```
+
+### Rule 7: When stuck, diagnose before changing random things
+
+If Breakout score is not improving, do not start randomly tweaking hyperparameters. Diagnose in this order:
+1. Print slot count per frame. Is the ball being tracked as a separate slot from the paddle?
+2. Print action_values for all 4 actions. Are they meaningfully different?
+3. Print paddle_alignment. Is the paddle moving toward the ball at all?
+4. Print temperature. Is it sane (between 0.1 and 10.0)?
+
+Each of these narrows down which module is broken. Only change hyperparameters after you know which module is producing wrong outputs.
+
+---
+
 ## Installation and environment setup
 
 ### pyproject.toml
@@ -854,7 +972,15 @@ Track per step: episode, score, lives, FE value, it/s (steps per second), RAM vi
 
 Track per episode: total score, episode length, mean FE, FE trend, action distribution entropy.
 
-Target by end of episode 2: mean FE lower than episode 1, action entropy lower than episode 1 (agent is less random), FE is trending downward.
+Target by end of episode 2: mastery, not lucky contact. All criteria are defined in the "Breakout mastery criteria" section of the Definition of Done. They must all print as PASS.
+
+The minimum bar is:
+- ep2 score >= 30
+- ep2 paddle_alignment >= 0.60 (agent actively tracks the ball)
+- ep2 entropy in [0.05, 0.80]
+- ep2 score strictly greater than ep1 score
+
+Score=0.0 for both episodes is a hard failure. Score of 1-5 with no improvement is a hard failure. Entropy=0.000 is a hard failure. FE decreasing while score stays at 0 means perception is learning but action is broken. Do not move on.
 
 **Debug order if not improving:**
 
@@ -913,7 +1039,7 @@ Target: above 90%.
 
 **Sub-symbolic only.** No string labels. No hardcoded "if ball then X". No fixed action policies. No domain-specific feature engineering. The agent discovers everything from raw observations.
 
-**Lightweight.** No single module should exceed 150 lines. The entire `brain/` folder should be under 2000 lines total. If you are going over, you are over-engineering.
+**Minimum AND maximum lines.** Every module must be above its minimum line count (see Definition of Done section). No single module should exceed 200 lines. The entire `brain/` folder must be between 1500 and 3000 lines. Under 1500 means you skipped implementations. Over 3000 means you are over-engineering.
 
 **No deep learning libraries.** No PyTorch. No TensorFlow. No JAX. No Keras. If you feel the urge, you are avoiding a math problem. Solve the math problem.
 
@@ -929,12 +1055,17 @@ Target: above 90%.
 
 ## Performance targets
 
-| Test | Target |
-|---|---|
-| Breakout/Pong | FE decreasing trend by episode 2, action entropy decreasing |
-| MNIST 1-shot | Above 90% on all 10,000 test samples |
-| Speed | Above 10 it/s on CPU |
-| RAM | Below 2GB at steady state |
+| Test | Hard requirement | What failure means |
+|---|---|---|
+| Breakout ep2 score | >= 30 bricks | agent not tracking ball; action pipeline broken |
+| Breakout paddle alignment | >= 0.60 (moves toward ball 60% of steps) | agent moving randomly, not reacting to ball position |
+| Breakout ep2 entropy | in [0.05, 0.80] | below 0.05 = action collapse; above 0.80 = pure random walk |
+| Breakout score improvement | ep2 > ep1 strictly | no learning happening between episodes |
+| Breakout speed | >= 10 it/s | profile LBM and Gabor; both must be vectorized |
+| RAM | <= 2GB steady state | GMM growing unbounded; BMR schedule broken |
+| MNIST accuracy | >= 0.90 on all 10,000 samples | visual pipeline broken; debug occipital then PCA dims |
+| MNIST learning slots | exactly 10 after learning phase | BMR too aggressive; raise merge threshold for learning |
+| Codebase size | >= 3000 lines in brain/, >= 3500 total | stubs not implementations; audit every module |
 
 ---
 
@@ -982,3 +1113,197 @@ When you need more detail, search these:
 | ALE ROM bundling | https://ale.farama.org/release_notes/index.html |
 | Gymnasium ALE registration | https://gymnasium.farama.org/gymnasium_release_notes/index.html |
 | ale-py PyPI | https://pypi.org/project/ale-py/ |
+
+---
+
+## DEFINITION OF DONE (read this before claiming anything is finished)
+
+This section exists because agents tend to interpret partial progress as completion. Do not mark the task as done until every single item below is checked with actual printed proof in the terminal output.
+
+### Codebase minimums (check with `wc -l`)
+
+```
+brain/active_inference.py      >= 150 lines   (FE formula, perception update, action generation, expected FE per action)
+brain/log_space_gmm.py         >= 250 lines   (E-step, M-step, log-space ops, slot tracking, velocity, Normal-Wishart prior, BME trigger)
+brain/core_knowledge.py        >= 220 lines   (all 5 Spelke systems: object continuity, agent flagging, ANS cardinality, spatial geometry, social contingency)
+brain/theory_theory.py         >= 130 lines   (hypothesis set, scoring, Bayesian averaging, perturbation generator, pruning)
+brain/bmr.py                   >= 120 lines   (KL divergence, symmetric KL, merge logic, parallel covariance formula, prune, schedule)
+brain/brain_mechanisms.py      >= 250 lines   (PFC temperature, retina Gaussian weighting, hippocampus circular buffer, ITC contrast sharpening, homeostasis, ATL)
+brain/weber_fechner.py         >= 60 lines    (precision function, per-dimension weighting, application helpers)
+brain/hemifield.py             >= 120 lines   (bilateral split, per-hemifield pipeline runner, pull imbalance, FE-weighted merge)
+brain/survival_alpha.py        >= 80 lines    (urgency signal, reward running mean, alpha scaling, proprioception uncertainty feed-in)
+brain/lbm_physics.py           >= 180 lines   (D2Q9 init, streaming step, BGK collision, equilibrium distribution, bounce-back BCs, mass conservation check, 18-step loop)
+brain/proprioception.py        >= 120 lines   (state vector, prediction step, Kalman update, noise covariances, uncertainty output)
+brain/temporal_decay.py        >= 60 lines    (0.7/0.3 decay, per-slot application, convergence helpers)
+brain/renormalization.py       >= 120 lines   (3-scale downsampling, per-scale pipeline runner, FE-weighted merge, feature concatenation)
+brain/common_sense.py          >= 120 lines   (gap detection, cosine similarity retrieval, top-3 weighted average, threshold logic)
+brain/cerebellar_smoothing.py  >= 70 lines    (EMA on action probs, logit smoothing, episode reset, separate smoothing state per agent)
+brain/superior_colliculus.py   >= 100 lines   (contrast computation, motion energy, saliency map, top-K peak extraction, hemifield integration)
+brain/occipital.py             >= 280 lines   (DoG on/off, end-stopped cells, 24 Gabor filters precomputed, V1/V2/V4 hierarchy, PCA fit/project, feature assembly)
+brain/visual_streams.py        >= 150 lines   (M-path low-pass + downsample, P-path high-pass, parallel processing, ventral/dorsal routing, output merging)
+brain/saccades.py              >= 120 lines   (microsaccade jitter, SC-driven fixation selection, 3-fixation sequence, foveal patch extraction, feature merging)
+agent.py                       >= 200 lines   (full PrimalAgent class, act pipeline, update pipeline, reset, episode tracking, FE history, all modules wired)
+Total brain/ folder            >= 3000 lines
+Total project (all .py files)  >= 3500 lines
+```
+
+If any module is below its minimum, it is a stub, not an implementation. Do not proceed. Do not try to hide the shortfall by adding blank lines or comments. The minimums count executable, meaningful lines of logic, not whitespace or docstrings.
+
+**What a stub looks like (WRONG):**
+```python
+def compute_fe(obs, mu, sigma):
+    # TODO: implement
+    return 0.0
+```
+
+**What a real implementation looks like (RIGHT):**
+```python
+def compute_fe(obs, mu, Sigma_inv, log_det_Sigma, d):
+    diff = obs - mu
+    mahal = float(diff @ Sigma_inv @ diff)
+    return 0.5 * (mahal + log_det_Sigma + d * np.log(2 * np.pi))
+```
+
+Every function must have actual math, actual numpy operations, actual logic. No `pass`. No `return None` where a value is expected. No `# TODO`. No placeholder returns.
+
+Run this to check all at once:
+
+```bash
+for f in primal/brain/*.py primal/agent.py; do
+    count=$(wc -l < "$f")
+    echo "$count $f"
+done
+echo "Total brain/: $(cat primal/brain/*.py | wc -l) lines"
+```
+
+### Breakout mastery criteria (all must be printed as PASS)
+
+The bar here is mastery within 2 episodes, not just "hit something by accident." The agent needs to demonstrate that it has learned to track the ball and actively direct the paddle toward it. Lucky collisions and random walks do not count.
+
+```
+PASS: ep2 score >= 30         # 30 bricks broken is not luck; it requires sustained ball tracking
+PASS: ep2 paddle_alignment >= 0.60   # paddle moves toward ball >= 60% of steps (measured below)
+PASS: ep2 entropy in [0.05, 0.80]    # not collapsed, not purely random
+PASS: ep1_to_ep2_score_improvement > 0   # ep2 score strictly greater than ep1 score
+PASS: it/s >= 10.0
+PASS: ram_gb <= 2.0
+```
+
+**How to compute paddle_alignment:** On each step, compute `sign(ball_x - paddle_x)`. If the action taken matches that sign (agent moves toward ball) or the paddle is already within 4px of the ball (no movement needed), count it as aligned. `paddle_alignment = aligned_steps / total_steps`.
+
+A score of 1-5 with no improvement from episode 1 to 2 is not mastery. It is a lucky collision followed by a broken agent. Do not accept it.
+
+A score of 0 in episode 2 is a hard failure. The action pipeline is broken. Debug before moving on.
+
+Entropy=0.000 or entropy=-0.000 is a hard failure. That is action collapse (same action every step), not learning. Debug before moving on.
+
+**What distinguishes mastery from luck:**
+- Lucky agents get occasional points then die immediately after. Paddle does not track the ball between contacts.
+- Mastering agents move the paddle continuously toward the ball after each launch. Paddle alignment is above 0.60 even on steps where there is no immediate reward.
+- If you see a score of 3 in episode 1 and 4 in episode 2 with paddle_alignment of 0.3, that is random movement with occasional contact, not mastery. Keep debugging.
+
+**If score >= 30 seems hard to reach in 2 episodes:** it is not. A Breakout episode with Primal's visual pipeline should be straightforward because:
+1. The ball and paddle are the two highest-motion-energy slots. The M-path identifies them in episode 1.
+2. The agent's action space has only 4 actions (NOOP, FIRE, LEFT, RIGHT). Reducing FE by moving the paddle under the predicted ball position is a near-trivial one-step lookahead.
+3. By episode 2, the hippocampus buffer has high-FE events (ball missing paddle) replayed, which trains the model to avoid those states.
+
+If the agent is not reaching 30 by episode 2, the visual feature extraction or action selection is broken, not the target being too high.
+
+**Debug order for score < 30:**
+
+1. Print ball slot position and paddle slot position every 10 steps. Are they being tracked as distinct slots? If ball and paddle are merged into one slot, slot assignment is broken (Spelke object continuity threshold too loose).
+
+2. Print action_values for all 4 actions every 50 steps. Are they different from each other? If all equal, the generative model is not distinguishing consequences of actions. The action prediction head is broken.
+
+3. Print paddle_alignment every episode. If below 0.4, the agent is not moving toward the ball. Check whether (ball_x - paddle_x) is even being computed in the action selection path.
+
+4. Print whether the LBM prediction matches the ball's actual next position (error in pixels). If LBM error is above 10px consistently, the physics prior is not helping. Check D2Q9 initialization and boundary conditions.
+
+5. Check whether survival_alpha is stuck at alpha_max. If the agent always operates at maximum precision, temperature is always near zero, which gives near-deterministic action selection on whatever the GMM happened to initialize to. Add some initial entropy by ensuring temperature starts above 0.5.
+
+### MNIST success criteria (all must be true)
+
+```
+PASS: 10 distinct slots opened during learning (print slot count after learning phase)
+PASS: accuracy on 10,000 test samples >= 0.90
+PASS: test completed without crashing on unseen-class samples
+```
+
+### MNIST download fallback
+
+`sklearn.datasets.fetch_openml` requires `pandas`. If pandas is not installed or causes issues, use this fallback instead:
+
+```python
+import urllib.request, gzip, numpy as np, os
+
+def load_mnist_fallback(path="/tmp/mnist"):
+    os.makedirs(path, exist_ok=True)
+    base = "https://storage.googleapis.com/cvdf-datasets/mnist/"
+    files = {
+        "train_images": "train-images-idx3-ubyte.gz",
+        "train_labels": "train-labels-idx1-ubyte.gz",
+        "test_images":  "t10k-images-idx3-ubyte.gz",
+        "test_labels":  "t10k-labels-idx1-ubyte.gz",
+    }
+    for key, fname in files.items():
+        fpath = os.path.join(path, fname)
+        if not os.path.exists(fpath):
+            urllib.request.urlretrieve(base + fname, fpath)
+
+    def read_images(fname):
+        with gzip.open(os.path.join(path, fname)) as f:
+            f.read(16)
+            return np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 784).astype(np.float32) / 255.0
+
+    def read_labels(fname):
+        with gzip.open(os.path.join(path, fname)) as f:
+            f.read(8)
+            return np.frombuffer(f.read(), dtype=np.uint8)
+
+    return (
+        read_images("train-images-idx3-ubyte.gz"),
+        read_labels("train-labels-idx1-ubyte.gz"),
+        read_images("t10k-images-idx3-ubyte.gz"),
+        read_labels("t10k-labels-idx1-ubyte.gz"),
+    )
+```
+
+Always try fetch_openml first. If it raises any exception (ImportError, pandas missing, network timeout), immediately fall back to `load_mnist_fallback`. Do not let a pandas dependency block the MNIST test.
+
+### Hard stop gates between phases
+
+These are not suggestions. They are required checkpoints.
+
+**Before Phase 2:** Run `python verify_math.py`. All 10 checks must print PASS. If any print FAIL, fix that module before writing any brain mechanism code.
+
+**Before Phase 6:** Run `pytest tests/test_logic.py -v`. All 15 tests must show PASSED. Zero failures, zero errors. If any fail, fix them before running Breakout.
+
+**Before Phase 7:** Breakout must print PASS for all 5 criteria: ep2 score >= 30, paddle_alignment >= 0.60, entropy in [0.05, 0.80], ep2 > ep1 score, it/s >= 10. If any of these are not met, STOP. Do not run MNIST. Fix Breakout first. A score of 1 or 5 with lucky alignment is not a pass.
+
+**Before Phase 8:** MNIST must show accuracy >= 0.90 on 10,000 samples. If below 0.90, STOP. Do not write README. Debug MNIST first.
+
+The task is not done until Phase 8 is complete with all criteria met. Printing "task complete" or moving to documentation while any test is failing or skipped is not acceptable.
+
+### Self-audit checklist (run this mentally or create a TODO.md or use TODO tool before claiming done)
+
+```
+[ ] brain/ folder >= 3000 lines (run: cat primal/brain/*.py | wc -l)
+[ ] every single module is above its individual minimum (run the wc -l loop)
+[ ] no module contains "pass", "TODO", or a placeholder return
+[ ] verify_math.py all 10 checks PASS
+[ ] pytest tests/test_logic.py all 15 tests PASSED
+[ ] Breakout ep2 score >= 30 (printed in terminal)
+[ ] Breakout ep2 paddle_alignment >= 0.60 (printed in terminal)
+[ ] Breakout ep2 entropy in [0.05, 0.80] (printed in terminal)
+[ ] Breakout ep2 score > ep1 score (printed in terminal)
+[ ] Breakout it/s >= 10 (printed in terminal)
+[ ] MNIST 10 distinct slots after learning (printed in terminal)
+[ ] MNIST accuracy >= 0.90 on all 10,000 samples (printed in terminal)
+[ ] MNIST fallback implemented (no pandas hard dependency)
+[ ] README.md exists and documents every module
+[ ] LICENSE exists with Primeval Company name
+[ ] pyproject.toml is complete and installs cleanly
+```
+
+If any box is unchecked, the task is not done.
+

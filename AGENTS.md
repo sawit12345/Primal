@@ -1327,7 +1327,33 @@ Only after both pass: proceed to Phase 0.
 
 ### Phase 0: Verify math before any production code
 
-Write a standalone `verify_math.py`. All 10 checks must pass before Phase 1.
+Write a standalone `verify_math.py`. All 12 checks must pass before Phase 1.
+
+**Every check must have a numeric threshold that would fail if the function returns a constant.**
+
+```python
+# WRONG: crash check disguised as a math check
+def check_fe():
+    ai = ActiveInference(feature_dim=8)
+    fe = ai.compute_fe(np.zeros(8), np.zeros(8), np.eye(8))
+    assert fe is not None   # passes even if compute_fe always returns 0.0
+    print("PASS")
+
+# RIGHT: threshold that actually fails on a broken implementation
+def check_fe():
+    ai = ActiveInference(feature_dim=8)
+    mu        = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    close_obs = mu.copy()
+    far_obs   = mu + np.array([50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    Sigma_inv = np.eye(8)
+    fe_close = ai.compute_fe(close_obs, mu, Sigma_inv)
+    fe_far   = ai.compute_fe(far_obs,   mu, Sigma_inv)
+    assert fe_far > fe_close * 100, (
+        f"FAIL: FE for distant obs ({fe_far:.2f}) is not >> FE for close obs ({fe_close:.2f}). "
+        f"Expected at least 100x. Check squared Mahalanobis distance."
+    )
+    print(f"PASS: FE close={fe_close:.4f} far={fe_far:.4f} ratio={fe_far/(fe_close+1e-8):.0f}x")
+```
 
 1. **FE is lower for correct predictions.** Generate Gaussian mu=5, sigma=1. Assert `FE(obs=5.0) < FE(obs=15.0)`.
 
@@ -1413,27 +1439,297 @@ class PrimalAgent:
 
 ### Phase 5: Logic verification tests
 
-`tests/test_logic.py` must include all of these as proper `pytest` functions with assertions (not print statements):
+**The tests must test logic, not just execution.**
+
+The single most common failure here is tests that look like this:
 
 ```python
-def test_fe_decreases_after_update()
-def test_gmm_grows_on_novel_observation()
-def test_bmr_reduces_components()
-def test_lbm_mass_conservation()
-def test_temporal_decay_converges()
-def test_hemifield_pull_asymmetry()
-def test_proprioception_uncertainty_decreases()
-def test_saccades_produce_distinct_fixations()
-def test_rg_features_are_scale_distinct()
-def test_theory_theory_map_improves_over_time()
-def test_weber_fechner_monotone()
-def test_cerebellar_smoothing_reduces_variance()
-def test_survival_alpha_increases_on_negative_reward()
-def test_common_sense_retrieves_similar_state()
-def test_lateral_inhibition_sharpens_responsibilities()
+# WRONG: this is not a test, it is a crash check
+def test_fe_decreases_after_update():
+    agent = PrimalAgent((84, 84, 3), 4)
+    obs = np.random.randn(84, 84, 3)
+    fe = agent.update(obs, 0, 1.0, obs, False)
+    assert fe is not None   # passes even if fe=999999 or fe=0.0 every time
 ```
 
-All must pass before Phase 6.
+A test that only checks "no exception raised" or "output is not None" gives zero signal about whether the math is correct. Every test below has a specific numeric threshold that must be satisfied. If the threshold is not in the test, the test is wrong.
+
+**The required implementation for each test (copy these exactly, do not simplify):**
+
+```python
+import numpy as np
+import pytest
+from primal.brain.active_inference import ActiveInference
+from primal.brain.log_space_gmm import LogSpaceGMM
+from primal.brain.bmr import BMR
+from primal.brain.lbm_physics import LBMPhysics
+from primal.brain.temporal_decay import TemporalDecay
+from primal.brain.hemifield import Hemifield
+from primal.brain.proprioception import Proprioception
+from primal.brain.saccades import Saccades
+from primal.brain.renormalization import Renormalization
+from primal.brain.theory_theory import TheoryTheory
+from primal.brain.weber_fechner import WeberFechner
+from primal.brain.cerebellar_smoothing import CerebellarSmoothing
+from primal.brain.survival_alpha import SurvivalAlpha
+from primal.brain.common_sense import CommonSense
+from primal.brain.log_space_gmm import LogSpaceGMM
+
+
+def test_fe_decreases_after_update():
+    gmm = LogSpaceGMM(feature_dim=8, max_components=10)
+    obs = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    fe_before = gmm.compute_fe(obs)
+    for _ in range(5):
+        gmm.update(obs)
+    fe_after = gmm.compute_fe(obs)
+    assert fe_after < fe_before, (
+        f"FE did not decrease after 5 updates on same observation. "
+        f"Before: {fe_before:.4f}, After: {fe_after:.4f}. "
+        f"This means the perception update is not working."
+    )
+
+
+def test_gmm_grows_on_novel_observation():
+    gmm = LogSpaceGMM(feature_dim=4, max_components=20, novelty_threshold=0.1)
+    obs_a = np.array([0.0, 0.0, 0.0, 0.0])
+    obs_b = np.array([100.0, 100.0, 100.0, 100.0])  # very far from obs_a
+    for _ in range(10):
+        gmm.update(obs_a)
+    n_before = gmm.n_components
+    gmm.update(obs_b)
+    n_after = gmm.n_components
+    assert n_after > n_before, (
+        f"GMM did not grow on novel observation. "
+        f"Components before: {n_before}, after: {n_after}. "
+        f"novelty_threshold may be too high or BME trigger is broken."
+    )
+
+
+def test_bmr_reduces_components():
+    gmm = LogSpaceGMM(feature_dim=4, max_components=20)
+    # Create 5 nearly identical components by feeding the same point repeatedly
+    base = np.array([1.0, 1.0, 1.0, 1.0])
+    for i in range(5):
+        gmm.slots.append(gmm._new_slot(base + np.random.randn(4) * 0.01))
+    n_before = gmm.n_components
+    bmr = BMR(merge_threshold=2.0, prune_threshold=0.01)
+    bmr.run(gmm)
+    n_after = gmm.n_components
+    assert n_after < n_before, (
+        f"BMR did not reduce components. Before: {n_before}, after: {n_after}. "
+        f"KL divergence between nearly-identical components should be near 0, "
+        f"well below merge_threshold=2.0. Check KL formula."
+    )
+
+
+def test_lbm_mass_conservation():
+    lbm = LBMPhysics(height=42, width=42)
+    density = np.random.rand(42, 42) + 0.1
+    lbm.set_density(density)
+    mass_before = lbm.total_mass()
+    for _ in range(18):
+        lbm.step()
+    mass_after = lbm.total_mass()
+    assert abs(mass_after - mass_before) < 1e-4, (
+        f"LBM does not conserve mass. Before: {mass_before:.6f}, after: {mass_after:.6f}. "
+        f"Difference: {abs(mass_after - mass_before):.2e}. "
+        f"Check streaming step (np.roll) and BGK collision. "
+        f"Python loops over grid cells will also cause this."
+    )
+
+
+def test_temporal_decay_converges():
+    decay = TemporalDecay(alpha=0.3)  # 0.7 old + 0.3 new
+    belief = 0.0
+    true_value = 5.0
+    for _ in range(200):
+        belief = decay.update(belief, true_value)
+    assert abs(belief - true_value) < 0.5, (
+        f"Temporal decay did not converge to true value after 200 steps. "
+        f"Belief: {belief:.4f}, true: {true_value}. "
+        f"Expected convergence within 0.5. Check 0.7/0.3 formula direction."
+    )
+
+
+def test_hemifield_pull_asymmetry():
+    hf = Hemifield(width=84, height=84)
+    # Strong saliency on left, none on right
+    saliency = np.zeros((84, 84))
+    saliency[:, :20] = 1.0   # left side only
+    fixation_x = hf.compute_fixation_x(saliency)
+    assert fixation_x < 42, (
+        f"Hemifield pull should be left of center when left saliency dominates. "
+        f"Got fixation_x={fixation_x:.1f}, center=42. "
+        f"Check pull weighting formula."
+    )
+
+
+def test_proprioception_uncertainty_decreases():
+    prop = Proprioception(state_dim=4)
+    trace_before = np.trace(prop.P)
+    obs = np.array([10.0, 10.0, 1.0, 0.5])
+    for _ in range(20):
+        prop.predict()
+        prop.update(obs)
+    trace_after = np.trace(prop.P)
+    assert trace_after < trace_before, (
+        f"Proprioception uncertainty did not decrease after 20 consistent observations. "
+        f"trace(P) before: {trace_before:.4f}, after: {trace_after:.4f}. "
+        f"Check Kalman gain K and update step (I - K@H)@P_prior."
+    )
+
+
+def test_saccades_produce_distinct_fixations():
+    sac = Saccades(frame_height=84, frame_width=84)
+    saliency = np.random.rand(84, 84)
+    fixations = sac.generate_fixations(saliency, n=3)
+    assert len(fixations) == 3, f"Expected 3 fixations, got {len(fixations)}"
+    # All 3 must not be the same point
+    coords = [(f[0], f[1]) for f in fixations]
+    assert len(set(coords)) > 1, (
+        f"All 3 fixations are identical: {coords}. "
+        f"Saccade generator is not producing distinct fixation points. "
+        f"Check peak selection and minimum-distance constraint."
+    )
+    # Each fixation must be within frame bounds
+    for fx, fy in coords:
+        assert 0 <= fx < 84 and 0 <= fy < 84, f"Fixation ({fx},{fy}) out of bounds"
+
+
+def test_rg_features_are_scale_distinct():
+    rg = Renormalization(scales=[1.0, 0.5, 0.25])
+    frame = np.random.rand(84, 84).astype(np.float32)
+    features = rg.extract_all_scales(frame)   # returns list of 3 feature vectors
+    assert len(features) == 3
+    cos_sim_01 = np.dot(features[0], features[1]) / (
+        np.linalg.norm(features[0]) * np.linalg.norm(features[1]) + 1e-8)
+    cos_sim_02 = np.dot(features[0], features[2]) / (
+        np.linalg.norm(features[0]) * np.linalg.norm(features[2]) + 1e-8)
+    assert cos_sim_01 < 0.99, (
+        f"Scale 1 and scale 2 features are nearly identical (cosine={cos_sim_01:.4f}). "
+        f"Downsampling is not producing distinct features. Check resize logic."
+    )
+    assert cos_sim_02 < 0.99, (
+        f"Scale 1 and scale 3 features are nearly identical (cosine={cos_sim_02:.4f}). "
+        f"Downsampling is not producing distinct features."
+    )
+
+
+def test_theory_theory_map_improves_over_time():
+    tt = TheoryTheory(n_hypotheses=4, feature_dim=8)
+    # True observation is near [1, 0, 0, 0, 0, 0, 0, 0]
+    true_obs = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    # Seed one hypothesis near the true observation
+    tt.hypotheses[0].mean = true_obs + np.random.randn(8) * 0.1
+    fe_early = tt.map_hypothesis().predict_fe(true_obs)
+    for _ in range(50):
+        tt.update(true_obs)
+    fe_late = tt.map_hypothesis().predict_fe(true_obs)
+    assert fe_late < fe_early, (
+        f"MAP hypothesis FE did not improve over 50 updates. "
+        f"Early FE: {fe_early:.4f}, late FE: {fe_late:.4f}. "
+        f"Bayesian weight update or hypothesis selection is broken."
+    )
+
+
+def test_weber_fechner_monotone():
+    wf = WeberFechner(alpha=1.0)
+    p1 = wf.precision(1.0)
+    p10 = wf.precision(10.0)
+    p100 = wf.precision(100.0)
+    assert p1 > p10 > p100, (
+        f"Weber-Fechner precision is not monotonically decreasing. "
+        f"precision(1)={p1:.4f}, precision(10)={p10:.4f}, precision(100)={p100:.4f}. "
+        f"Expected p1 > p10 > p100. Check formula: alpha / (log1p(|x|) + eps)."
+    )
+
+
+def test_cerebellar_smoothing_does_not_collapse():
+    cs = CerebellarSmoothing(n_actions=4, alpha=0.3)
+    # Alternate between two different action distributions
+    for i in range(500):
+        if i % 2 == 0:
+            raw = np.array([0.7, 0.1, 0.1, 0.1])
+        else:
+            raw = np.array([0.1, 0.7, 0.1, 0.1])
+        cs.smooth(raw)
+    final_probs = cs.smooth_probs
+    entropy = -np.sum(final_probs * np.log(final_probs + 1e-8))
+    assert entropy > 0.5, (
+        f"Cerebellar smoothing collapsed after 500 alternating steps. "
+        f"Final probs: {final_probs}, entropy: {entropy:.4f}. "
+        f"Expected entropy > 0.5 when input alternates between two distributions. "
+        f"EMA alpha may be too high, or smooth_probs not being updated correctly."
+    )
+
+
+def test_survival_alpha_increases_on_negative_reward():
+    sa = SurvivalAlpha(alpha_min=0.5, alpha_max=3.0)
+    # Feed positive rewards: alpha should stay low
+    for _ in range(20):
+        sa.update(reward=1.0)
+    alpha_good = sa.alpha
+    # Feed negative rewards: alpha should rise
+    for _ in range(20):
+        sa.update(reward=-1.0)
+    alpha_bad = sa.alpha
+    assert alpha_bad > alpha_good, (
+        f"Survival alpha did not increase on negative rewards. "
+        f"Alpha after positive rewards: {alpha_good:.4f}, "
+        f"after negative rewards: {alpha_bad:.4f}. "
+        f"Check urgency formula and reward_running_mean update."
+    )
+
+
+def test_common_sense_retrieves_similar_state():
+    cs = CommonSense(buffer_size=100, feature_dim=8)
+    # Store a known state
+    known_features = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    known_action = 2
+    cs.store(known_features, known_action, fe=5.0)
+    # Query with a very similar state
+    query = known_features + np.random.randn(8) * 0.01
+    retrieved_action, sim = cs.retrieve(query)
+    assert sim > 0.95, (
+        f"Common sense retrieval similarity too low: {sim:.4f}. "
+        f"Expected > 0.95 for nearly identical feature vectors. "
+        f"Check cosine similarity computation."
+    )
+    assert retrieved_action == known_action, (
+        f"Common sense retrieved wrong action: {retrieved_action}, expected {known_action}."
+    )
+
+
+def test_lateral_inhibition_sharpens_responsibilities():
+    gmm = LogSpaceGMM(feature_dim=4, max_components=5)
+    # Force 3 components with similar means
+    for i in range(3):
+        slot = gmm._new_slot(np.array([float(i), 0.0, 0.0, 0.0]))
+        gmm.slots.append(slot)
+    obs = np.array([0.5, 0.0, 0.0, 0.0])  # between component 0 and 1
+    resp_before = gmm.e_step(obs)
+    entropy_before = -np.sum(resp_before * np.log(resp_before + 1e-8))
+    gmm.apply_lateral_inhibition(obs)
+    resp_after = gmm.e_step(obs)
+    entropy_after = -np.sum(resp_after * np.log(resp_after + 1e-8))
+    assert entropy_after < entropy_before, (
+        f"Lateral inhibition did not sharpen responsibilities. "
+        f"Entropy before: {entropy_before:.4f}, after: {entropy_after:.4f}. "
+        f"Expected entropy to decrease (sharper winner-take-all). "
+        f"Check ITC contrast sharpening formula."
+    )
+```
+
+**Every test has:**
+1. A specific numeric threshold (`< 0.5`, `> 0.95`, `< 0.99`, etc.)
+2. A failure message that explains what the threshold means and what is likely wrong
+3. Synthetic data that controls the expected outcome (not random game frames)
+4. An assertion that would fail if the implementation returns a constant, a zero, or a placeholder
+
+**A test that passes by doing nothing is not a test.** If you can make a test pass by returning `0.0` from the function under test, the test is wrong. Every test above would fail if the function returned a constant.
+
+All 15 must pass before Phase 6. If any fail, read the failure message. It tells you which formula is wrong.
 
 ---
 

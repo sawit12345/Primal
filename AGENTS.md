@@ -40,6 +40,16 @@ Do not repeat these mistakes.
 
 The Definition of Done section at the bottom of this file has a checklist. Run through it before claiming the task is complete.
 
+**Known failure modes from previous attempt (do not repeat these):**
+
+1. Smoke run of 150 steps passed off as a Breakout episode. 150 steps is not an episode. Run full episodes until the game ends (lives exhausted). No max_steps below 10,000.
+
+2. it/s = 2.20 (5x below requirement). LBM had Python loops over grid cells. Gabor was applied pixel by pixel. Both must be fully vectorized numpy operations. Run the speed gate before Phase 6 and fix it first.
+
+3. MNIST: 2 slots opened instead of 10. BMR was running during the 10-sample learning phase and merged digit prototypes. Set `agent.bmr.enabled = False` before the learning phase. Set `agent.gmm.novelty_threshold = 0.0` to force new slot creation for each sample. Verify slot count == 10 before running classification.
+
+4. Accuracy = 0.1009 on MNIST. This is random guessing. It is a direct consequence of having only 2 slots. Fix the slot count first. If slot count is 10 and accuracy is still below 0.5, the visual features are collapsing (DoG returning zeros, PCA too low-dimensional, or Gabor applied to wrong input).
+
 ---
 
 ## ANTI-LAZINESS RULES
@@ -586,6 +596,22 @@ Run 18 steps per frame to get a stable one-frame lookahead.
 
 **Mass conservation:** `sum(f over all directions and all cells)` must be constant before and after every step. Add `assert np.isclose(mass_before, mass_after, rtol=1e-5)` in dev mode.
 
+**Vectorization requirement (non-negotiable):**
+
+The entire LBM step must run in vectorized numpy operations. No Python loops over grid cells. The streaming step uses `np.roll`. The collision step uses array-wise arithmetic on the full `f[9, H, W]` array. A correctly vectorized 18-step LBM on a 210x160 grid runs in under 3ms on a modern CPU. If your LBM step is taking 50ms, you have Python loops inside it. Find them and remove them.
+
+```python
+# FORBIDDEN (Python loop over grid):
+for x in range(W):
+    for y in range(H):
+        f[i, y, x] = f[i, y, x] - (f[i, y, x] - feq[i, y, x]) / tau
+
+# REQUIRED (fully vectorized):
+f -= (f - feq) / tau   # collision: entire 9xHxW array at once
+for i, (dy, dx) in enumerate(velocities):
+    f[i] = np.roll(np.roll(f[i], dy, axis=0), dx, axis=1)  # streaming
+```
+
 **Search for more:**
 - "D2Q9 lattice Boltzmann weights velocities" at Wikipedia or http://wiki.palabos.org
 - "lattice Boltzmann BGK collision operator"
@@ -723,7 +749,24 @@ High response at stroke endings, low in the middle of strokes. Critical for MNIS
 
 **Step 3: V1 Gabor filters (8 orientations x 3 frequencies = 24 filters)**
 
-Precompute at init time using `scipy.ndimage` or `cv2.getGaborKernel`. Never recompute.
+Precompute all 24 kernels at init time. Never recompute. Store as a stacked array `kernels: np.ndarray` of shape `(24, kH, kW)`.
+
+**Vectorization requirement:** Apply all 24 filters in a batch, not a loop. Use `scipy.ndimage.convolve` once per filter but stack the results. Or use `cv2.filter2D` in a list comprehension. A batch of 24 Gabor convolutions on a 210x160 image should complete in under 15ms. If it is taking 200ms, you are recomputing the kernels on each frame or applying them in a Python loop with per-pixel operations.
+
+```python
+# FORBIDDEN:
+responses = []
+for kernel in self.kernels:
+    for y in range(H):
+        for x in range(W):
+            responses.append(convolve_at(frame, kernel, y, x))
+
+# REQUIRED:
+responses = np.stack([
+    scipy.ndimage.convolve(frame, k, mode="reflect")
+    for k in self.kernels   # 24 calls, each vectorized internally
+], axis=0)   # shape: (24, H, W)
+```
 
 Orientations: 0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5 degrees.
 Spatial frequencies (sigma): 4, 2, 1 pixels.
@@ -968,9 +1011,61 @@ gym.register_envs(ale_py)  # REQUIRED, without this Atari envs do not exist
 env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
 ```
 
-Track per step: episode, score, lives, FE value, it/s (steps per second), RAM via psutil.
+**Speed gate (run this before anything else in Phase 6):**
 
-Track per episode: total score, episode length, mean FE, FE trend, action distribution entropy.
+Before running full episodes, verify the agent can actually run at speed. Run 200 steps and measure it/s:
+
+```python
+import time, psutil, os
+obs, _ = env.reset()
+t0 = time.perf_counter()
+for _ in range(200):
+    action = agent.act(obs)
+    obs, reward, term, trunc, _ = env.step(action)
+    if term or trunc:
+        obs, _ = env.reset()
+elapsed = time.perf_counter() - t0
+its = 200 / elapsed
+print(f"Speed check: {its:.2f} it/s")
+assert its >= 10.0, f"FAIL: {its:.2f} it/s is below 10. Optimize before running full episodes."
+```
+
+If it/s is below 10, stop. Do not run full episodes at 2 it/s: it wastes time and produces garbage results because the agent cannot react fast enough. Profile with `cProfile` and fix the bottleneck first. The two known bottlenecks are:
+
+**LBM:** Must be fully vectorized over the entire spatial grid in one numpy operation per step. No Python loops over grid cells. `np.roll` for streaming, array-wise BGK for collision. If you have any `for x in range(width): for y in range(height):` inside the LBM step, that is the bottleneck.
+
+**Gabor convolution:** Must use `scipy.ndimage.convolve` or `cv2.filter2D` applied to the full image at once. Precompute all 24 kernels at init time. Apply them in a batch using `np.stack` and `scipy.ndimage.convolve`. No per-pixel loops.
+
+**Full episode run (no step limits, no smoke runs):**
+
+A smoke run of 150 steps is not a Breakout test. 150 steps is roughly 2 seconds of gameplay and covers less than one life. The agent never gets enough frames to learn anything meaningful.
+
+Run at least 2 complete episodes where each episode ends only when the game says it is over (all lives exhausted or episode done flag). Do not impose `max_steps` unless it is above 10,000. Print results after each full episode.
+
+```python
+for ep in range(1, 3):
+    obs, _ = env.reset()
+    ep_score = 0
+    ep_steps = 0
+    aligned = 0
+    done = False
+    agent.reset()
+    while not done:
+        action = agent.act(obs)
+        # compute paddle alignment before stepping
+        # (requires extracting ball_x and paddle_x from slot means)
+        next_obs, reward, term, trunc, info = env.step(action)
+        agent.update(obs, action, reward, next_obs, term or trunc)
+        ep_score += reward
+        ep_steps += 1
+        obs = next_obs
+        done = term or trunc
+    print(f"ep={ep} score={ep_score} steps={ep_steps} alignment={aligned/ep_steps:.3f}")
+```
+
+Track per step: episode, score, lives, FE value, it/s (rolling 100-step window), RAM via psutil.
+
+Track per episode: total score, episode length, mean FE, FE trend, action distribution entropy, paddle_alignment.
 
 Target by end of episode 2: mastery, not lucky contact. All criteria are defined in the "Breakout mastery criteria" section of the Definition of Done. They must all print as PASS.
 
@@ -979,8 +1074,36 @@ The minimum bar is:
 - ep2 paddle_alignment >= 0.60 (agent actively tracks the ball)
 - ep2 entropy in [0.05, 0.80]
 - ep2 score strictly greater than ep1 score
+- it/s >= 10 (measured during episode, not just warmup)
 
 Score=0.0 for both episodes is a hard failure. Score of 1-5 with no improvement is a hard failure. Entropy=0.000 is a hard failure. FE decreasing while score stays at 0 means perception is learning but action is broken. Do not move on.
+
+**Specific debug for paddle_alignment = 0.000:**
+
+If paddle never moves toward the ball, print the following every 50 steps during the episode:
+
+```python
+ball_slot  = agent.get_slot_by_flag("agent")   # highest residual velocity slot
+paddle_slot = agent.get_slot_by_flag("self")    # proprioception center
+ball_x   = ball_slot.mu[0] if ball_slot else None
+paddle_x = paddle_slot.mu[0] if paddle_slot else None
+action_values = agent.get_action_values()       # FE reduction per action
+print(f"  ball_x={ball_x:.1f} paddle_x={paddle_x:.1f} action_values={action_values}")
+```
+
+If `ball_x` is None, the ball is not being tracked as a slot. Spelke object continuity threshold is too loose, or M-path is not feeding position into slots.
+
+If `action_values` are all equal, the generative model does not distinguish action consequences. The action head is returning a constant. Check that action is included in the state prediction and that different actions actually produce different predicted next states.
+
+If `action_values` differ but the agent still picks the same action every time, check that temperature is not near zero. Print `agent.temperature` every step.
+
+**Specific debug for entropy = 0.012 (near-zero but not exactly zero):**
+
+Entropy of 0.012 means the agent is picking one action about 99% of the time with tiny probability on others. This is not "slightly exploratory," it is collapsed. The cerebellar EMA is locking onto one action. Check:
+
+1. Is `prev_smooth_probs` being reset at episode start? If not, it carries the previous episode's collapsed distribution.
+2. Is the EMA alpha too aggressive? `0.7 * stale_probs + 0.3 * new_probs` where stale_probs is already [1, 0, 0, 0] will converge back to [1, 0, 0, 0] regardless of new_probs within a few steps.
+3. Print the raw (pre-smoothing) action_probs. If those are already collapsed, the problem is upstream in action generation, not in the smoother.
 
 **Debug order if not improving:**
 
@@ -1000,27 +1123,57 @@ Score=0.0 for both episodes is a hard failure. Score of 1-5 with no improvement 
 
 Load via `sklearn.datasets.fetch_openml("mnist_784", version=1)`.
 
-**Learning (10 samples):** Show 1 sample per class in order 0-9. Call `agent.update(obs=image, action=0, reward=1.0, next_obs=image, done=False)` for each. The 10 GMM slots that open become the 10 class prototypes. After each update, record the mapping `slot_index -> class_label` by noting which slot index has the highest responsibility for that sample. Store this mapping in a dict: `slot_to_class = {slot_idx: label}`.
+**Critical: disable BMR during the learning phase.**
 
-**One-shot handling for unseen classes:** Not all deployments will have clean 1-sample-per-class setup. The agent must handle the case where a class was never shown during learning, or where a test sample\'s nearest slot belongs to a class the slot_to_class dict does not cover. The rule: if the winning slot index is not in `slot_to_class`, open a new slot on the spot (treat the test sample as a one-shot learning event), assign it a provisional label of `"unknown_N"`, and continue. This is the same BME mechanism used everywhere else. The agent does not crash or default to a fixed label. It grows.
+The single most common MNIST failure is that BMR merges digit prototypes together during the 10-sample learning phase. If you show the agent "0" and "6" and they have similar visual features, BMR will merge their slots before you finish the learning phase. You end up with 2 slots instead of 10, and accuracy drops to 10% (random guessing).
 
-For the accuracy calculation: count "unknown_N" predictions as incorrect (conservative), but track them separately so you can see how many unseen-class events occurred.
+The fix is a one-line flag: `agent.bmr.enabled = False` before learning, `agent.bmr.enabled = True` after. The BMR module must expose this flag.
 
-**Classification (10,000 samples):** For each test sample, call `agent.act(obs=image)`. Get the winning slot index. Look up `slot_to_class[slot_idx]`. If missing, apply the one-shot handler above. Track accuracy over all 10,000 samples.
+```python
+# MNIST learning phase
+agent.reset()
+agent.bmr.enabled = False          # CRITICAL: disable BMR during learning
+agent.gmm.novelty_threshold = 0.0  # CRITICAL: always open new slot for each new sample
+
+slot_to_class = {}
+for label in range(10):
+    sample = train_X[train_y == label][0].reshape(28, 28)
+    agent.update(obs=sample, action=0, reward=1.0, next_obs=sample, done=False)
+    # find which slot just opened (highest responsibility for this sample)
+    resp = agent.gmm.e_step(agent.extract_features(sample))
+    winning_slot = int(np.argmax(resp))
+    slot_to_class[winning_slot] = label
+
+agent.bmr.enabled = True           # re-enable BMR for classification phase
+print(f"Slots after learning: {agent.gmm.n_components} (need exactly 10)")
+assert agent.gmm.n_components >= 10, "FAIL: BMR destroyed prototypes during learning"
+```
+
+If the slot count after learning is less than 10, do not proceed to classification. Debug this first.
+
+**Learning (10 samples):** Show 1 sample per class in order 0-9. After each update, record the mapping `slot_index -> class_label` by noting which slot has highest responsibility for that sample. Store in `slot_to_class = {slot_idx: label}`.
+
+**One-shot handling for unseen classes at test time:** If a test sample's winning slot is not in `slot_to_class` (because BMR opened a new slot during classification, or a class was never in training), open a new slot on the spot, assign provisional label `"unknown_N"`, count as incorrect, but do not crash.
+
+For the accuracy calculation: unknown predictions count as incorrect. Track them separately so you can see how many occurred.
+
+**Classification (10,000 samples):** For each test sample, call `agent.act(obs=image)`. Get winning slot. Look up `slot_to_class`. If missing, apply one-shot handler. Track accuracy over all 10,000 samples.
 
 Target: above 90%.
 
 **Debug order if below 90%:**
 
-1. Check that 10 distinct slots opened during learning. If BMR merged some, increase the merge threshold during learning phase.
+1. **Slot count.** If fewer than 10 slots after learning, BMR is the problem. Verify `agent.bmr.enabled = False` was set, and verify `agent.gmm.novelty_threshold = 0.0` forces new slot creation. If novelty_threshold is not 0, the GMM may assign a new sample to an existing slot instead of opening a new one.
 
-2. Check saccades. Print fixation coordinates on 5 test samples. They must not all be the same point.
+2. **Feature distinctiveness.** After the learning phase, print the pairwise cosine similarity between all 10 slot means. If any two slots have cosine similarity above 0.98, their feature vectors are nearly identical. This means the visual pipeline is not distinguishing those two digit classes. Check V4 feature dimensionality: is PCA reducing to enough dimensions? Try increasing to 128 or 192.
 
-3. Check DoG. Uniform region must give near-zero response. Edge must give high response.
+3. **Saccades.** Print fixation coordinates for 5 test samples from different classes. They must differ between images. If all images get the same fixation at (14, 14), the SC saliency map is returning uniform output. Check DoG is not returning all-zeros.
 
-4. Check end-stopped cells. Middle of a long stroke must give low response. Stroke endings must give high response.
+4. **DoG.** On a MNIST image: a blank corner must give near-zero response. A stroke edge must give a clearly positive response. If DoG is all-zeros or all-identical, Gabor receives nothing useful and all features collapse.
 
-5. Check PCA. How much variance do 96 components retain? If below 90%, increase dims to 128 or 192.
+5. **End-stopped cells.** On a digit "1" image: the tip of the stroke should have high end-stopped response. The middle of the stroke should have near-zero end-stopped response. If end-stopped response is uniform, the subtraction of the long-Gabor from the short-Gabor is wrong (signs may be inverted).
+
+6. **PCA variance.** Print `pca.explained_variance_ratio_.sum()`. If below 0.90, increase n_components from 96 to 192 and refit.
 
 ---
 
@@ -1221,13 +1374,19 @@ If the agent is not reaching 30 by episode 2, the visual feature extraction or a
 
 5. Check whether survival_alpha is stuck at alpha_max. If the agent always operates at maximum precision, temperature is always near zero, which gives near-deterministic action selection on whatever the GMM happened to initialize to. Add some initial entropy by ensuring temperature starts above 0.5.
 
-### MNIST success criteria (all must be true)
+### MNIST success criteria (all must be true, printed as PASS)
 
 ```
-PASS: 10 distinct slots opened during learning (print slot count after learning phase)
-PASS: accuracy on 10,000 test samples >= 0.90
-PASS: test completed without crashing on unseen-class samples
+PASS: agent.gmm.n_components >= 10 after learning phase (BMR was disabled during learning)
+PASS: slot_to_class has exactly 10 entries (one per class)
+PASS: pairwise cosine similarity between all 10 slot means is below 0.98 (slots are distinct)
+PASS: accuracy on all 10,000 test samples >= 0.90
+PASS: test ran without crashing on unknown-class inputs
 ```
+
+If `n_components < 10` after learning, the only cause is BMR merging prototypes or GMM not opening new slots. Fix: ensure `agent.bmr.enabled = False` and `agent.gmm.novelty_threshold = 0.0` during the learning phase.
+
+Accuracy = 0.10 means random guessing. This is not "a low score" or "partially working." It means the classifier has exactly 0 useful information. Debug starts at slot count, not at hyperparameter tuning.
 
 ### MNIST download fallback
 
@@ -1278,28 +1437,33 @@ These are not suggestions. They are required checkpoints.
 
 **Before Phase 6:** Run `pytest tests/test_logic.py -v`. All 15 tests must show PASSED. Zero failures, zero errors. If any fail, fix them before running Breakout.
 
-**Before Phase 7:** Breakout must print PASS for all 5 criteria: ep2 score >= 30, paddle_alignment >= 0.60, entropy in [0.05, 0.80], ep2 > ep1 score, it/s >= 10. If any of these are not met, STOP. Do not run MNIST. Fix Breakout first. A score of 1 or 5 with lucky alignment is not a pass.
+**Before Phase 7:** Breakout must print PASS for all 5 criteria: ep2 score >= 30, paddle_alignment >= 0.60, entropy in [0.05, 0.80], ep2 > ep1 score, it/s >= 10. The speed gate (200-step warmup timing) must have passed first. If any criteria fail, STOP. Do not run MNIST. Fix Breakout first. A score of 1-5 with lucky alignment is not a pass. A smoke run of 150 steps is not Breakout.
 
 **Before Phase 8:** MNIST must show accuracy >= 0.90 on 10,000 samples. If below 0.90, STOP. Do not write README. Debug MNIST first.
 
 The task is not done until Phase 8 is complete with all criteria met. Printing "task complete" or moving to documentation while any test is failing or skipped is not acceptable.
 
-### Self-audit checklist (run this mentally or create a TODO.md or use TODO tool before claiming done)
+### Self-audit checklist (run this mentally before claiming done)
 
 ```
 [ ] brain/ folder >= 3000 lines (run: cat primal/brain/*.py | wc -l)
-[ ] every single module is above its individual minimum (run the wc -l loop)
+[ ] every module above its individual minimum (run the wc -l loop)
 [ ] no module contains "pass", "TODO", or a placeholder return
 [ ] verify_math.py all 10 checks PASS
 [ ] pytest tests/test_logic.py all 15 tests PASSED
+[ ] Speed gate: 200-step timing gives >= 10 it/s (printed before Phase 6)
+[ ] Breakout test used full episodes, no max_steps below 10,000
 [ ] Breakout ep2 score >= 30 (printed in terminal)
 [ ] Breakout ep2 paddle_alignment >= 0.60 (printed in terminal)
 [ ] Breakout ep2 entropy in [0.05, 0.80] (printed in terminal)
 [ ] Breakout ep2 score > ep1 score (printed in terminal)
-[ ] Breakout it/s >= 10 (printed in terminal)
-[ ] MNIST 10 distinct slots after learning (printed in terminal)
+[ ] Breakout it/s >= 10 during episode (printed in terminal)
+[ ] agent.bmr.enabled = False was set before MNIST learning phase
+[ ] agent.gmm.novelty_threshold = 0.0 was set before MNIST learning phase
+[ ] MNIST slot count == 10 after learning (printed in terminal)
+[ ] MNIST pairwise cosine similarity < 0.98 for all slot pairs (printed)
 [ ] MNIST accuracy >= 0.90 on all 10,000 samples (printed in terminal)
-[ ] MNIST fallback implemented (no pandas hard dependency)
+[ ] MNIST fallback implemented (no hard pandas dependency)
 [ ] README.md exists and documents every module
 [ ] LICENSE exists with Primeval Company name
 [ ] pyproject.toml is complete and installs cleanly

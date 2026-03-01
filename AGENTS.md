@@ -1,2206 +1,346 @@
-# AGENTS.md - Primal Framework
-
-Come back here whenever you lose track. This is the source of truth. Read it fully before touching code.
-
----
-
-## What you're building
-
-A framework called **Primal**, built by **Primeval Company**. It unifies neuroscience and Bayesian ideas into a single lightweight, fully sub-symbolic agent. No hardcoded domain knowledge. No hardcoded policy. No hardcoded predictions. The agent starts completely blind.
-
-**It must be universal.** Breakout, Pong, MNIST, robotic control, text tokens, audio spectrograms, financial time series: the agent handles any observation space and any action space without modifying the architecture. The only thing that changes between tasks is the observation shape and action count passed to `__init__`. If you find yourself writing task-specific logic anywhere except the test scripts, stop and rethink.
-
-The output must:
-- Run on Python with numpy, scipy, and small libs only (no PyTorch, no TensorFlow, no JAX)
-- Learn Breakout or Pong in under 2 episodes (3 lives)
-- Classify the full MNIST test set (10,000 samples) above 90% accuracy, given 1 sample per class, with graceful one-shot handling for any class the agent has not seen at test time (open a new slot on the spot, classify by nearest slot)
-- Stay fast (track it/s, target above 10) and stay lean (track RAM, target below 2GB)
-- Pass logic and math verification, not just execution
-
----
-
-
-## THE ACTUAL PROBLEM (read this before anything else)
-
-Two attempts have failed. Not because the instructions were unclear. Because there are two fundamental architectural gaps that make the full architecture impossible to implement correctly in one shot. Fix these first.
-
----
-
-### Gap 1: Action selection has no forward model (this is why score=0 and alignment=0)
-
-The full architecture says "select action that minimizes expected FE." But minimizing expected FE requires predicting what the observation will look like AFTER each action. Without that prediction, every action looks equally good, entropy collapses, the paddle sits still, score stays 0.
-
-The AGENTS.md never specified how the agent predicts the consequence of an action. That is the gap.
-
-**The fix: specify it explicitly.**
-
-For a discrete action space, the forward model works like this:
-
-```python
-def predict_next_state(self, current_features, action):
-    """
-    Given current GMM state and an action, predict the next feature vector.
-    This is the forward model. Without this, action selection is random.
-    """
-    # For each active slot, predict next position using:
-    # 1. Slot velocity (from temporal tracking)
-    # 2. Action effect on the agent-controlled slot (paddle)
-    predicted_slots = []
-    for k, slot in enumerate(self.gmm.slots):
-        next_mu = slot.mu + slot.velocity   # physics: constant velocity
-        if slot.is_self:                    # this is the paddle
-            # action directly moves paddle
-            if action == LEFT:
-                next_mu[0] -= paddle_speed
-            elif action == RIGHT:
-                next_mu[0] += paddle_speed
-        predicted_slots.append(next_mu)
-    return predicted_slots
-
-def get_action_values(self, current_obs):
-    """
-    For each action, predict next state, compute FE of that prediction vs
-    the actual next observation. Lower predicted FE = better action.
-    Use current observation as a proxy for next observation (one-step lookahead).
-    """
-    current_features = self.extract_features(current_obs)
-    values = []
-    for action in range(self.n_actions):
-        predicted_next = self.predict_next_state(current_features, action)
-        predicted_fe = self.gmm.compute_fe_for_prediction(predicted_next, current_features)
-        values.append(-predicted_fe)   # higher value = lower FE = better
-    return np.array(values)
-```
-
-For Breakout specifically: the action that minimizes FE is almost always the action that moves the paddle closest to the predicted ball position. This is because ball-paddle distance is the dominant source of surprise. Once the GMM is tracking the ball slot and the paddle slot, the forward model automatically produces this behavior.
-
-This must be implemented before Phase 6. Without it, `get_action_values` returns a constant array, temperature-scaled softmax gives near-uniform probabilities, cerebellar smoothing locks onto one action within 10 steps, entropy goes to 0.01, score stays 0.
-
----
-
-### Gap 2: The architecture is too large to debug end-to-end (this is why both attempts failed)
-
-19 modules, all wired, tested at the end. One wrong sign in the FE formula makes Breakout score 0. One wrong threshold in the GMM makes MNIST accuracy 10%. The test output ("score=0") gives no information about which of 19 modules caused it.
-
-**The fix: Minimum Viable Agent first, then add modules.**
-
-Build the MVP below. Get it working. Then add brain modules one at a time. Each module addition should change the results in a measurable, expected direction. If adding a module makes results worse, that module is broken. Remove it and fix it.
-
----
-
-## PHASE -1: Minimum Viable Agent (do this BEFORE Phase 0)
-
-The MVP is a stripped-down version of Primal with only the components needed to prove the core loop works. It must produce a nonzero Breakout score and above-random MNIST accuracy. Then you know the plumbing is right and can add brain modules safely.
-
-### MVP components (implement these, nothing else yet)
-
-**1. Feature extraction (50 lines):**
-- Grayscale the input frame
-- Downsample to 42x42 (same as standard Atari preprocessing)
-- Compute frame difference: `diff = current_gray - prev_gray`
-- Flatten and concatenate: `features = np.concatenate([current_gray.flatten(), diff.flatten()])`
-- Normalize to [-1, 1]
-- Output: 3528-dim vector
-
-**2. Log-space GMM with growing slots (the exact same GMM from Section 2, no shortcuts):**
-- Initialize with 1 slot
-- E-step and M-step in log space
-- Grow when novelty below threshold
-- No BMR yet (add later)
-- Slot velocity tracking: `velocity_k = mu_k_current - mu_k_prev`
-
-**3. Forward model and action selection (the piece that was missing):**
-- For each action, apply that action's effect to the agent-controlled slot's predicted position
-- Compute predicted FE for each resulting state
-- Return action values as `-predicted_FE` per action
-- Full code above in Gap 1
-
-**4. Simple action generation:**
-```python
-def act(self, obs):
-    features = self.extract_features(obs)
-    action_values = self.get_action_values(obs)
-    temperature = max(0.5, self.base_temp * np.exp(self.fe_running_mean / 10.0))
-    logits = action_values / temperature
-    logits -= logits.max()   # numerical stability
-    probs = np.exp(logits)
-    probs /= probs.sum()
-    # EMA smoothing
-    self.smooth_probs = 0.7 * self.smooth_probs + 0.3 * probs
-    self.smooth_probs /= self.smooth_probs.sum()
-    return int(np.random.choice(self.n_actions, p=self.smooth_probs))
-```
-
-**5. Update loop:**
-```python
-def update(self, obs, action, reward, next_obs, done):
-    features = self.extract_features(next_obs)
-    fe = self.gmm.compute_fe(features)
-    self.gmm.update(features)
-    self.fe_running_mean = 0.99 * self.fe_running_mean + 0.01 * fe
-    if done:
-        self.smooth_probs = np.ones(self.n_actions) / self.n_actions  # reset on episode end
-    return fe
-```
-
-### MVP expected results
-
-Run 2 Breakout episodes. The MVP with only these 5 components should produce:
-
-```
-PASS: ep2 score >= 5       (MVP bar, not full bar)
-PASS: ep2 entropy > 0.10   (not collapsed)
-PASS: it/s >= 30           (MVP is fast, no LBM or Gabor)
-PASS: paddle_alignment > 0.45  (paddle moves toward ball more often than not)
-```
-
-Score of 5 with the MVP is realistic because:
-- The frame difference highlights the ball as the highest-motion pixel cluster
-- The GMM opens a slot for the ball and a slot for the paddle within 20 frames
-- The forward model moves the paddle toward the predicted ball position
-- No complex vision needed because the ball is already the most salient feature
-
-For MNIST with the MVP:
-- Use HOG features (16x16 cells, 8 orientations) instead of the full visual pipeline
-- Show 1 sample per class, BMR disabled, 10 slots open
-- Expected accuracy: above 70% on 10,000 samples
-
-```python
-from skimage.feature import hog
-def extract_features_mnist(image):
-    return hog(image.reshape(28, 28), orientations=8,
-               pixels_per_cell=(4, 4), cells_per_block=(2, 2),
-               feature_vector=True)
-```
-
-### Once MVP passes its targets, then move to Phase 0
-
-Only after the MVP produces:
-- Breakout ep2 score >= 5
-- Breakout paddle_alignment > 0.45
-- MNIST accuracy > 70%
-
-...do you proceed to Phase 0 (math verification) and start adding brain modules one by one.
-
-### Adding brain modules (incremental, one at a time)
-
-After MVP passes, add modules in this order. After each addition, run the Breakout test and verify the score did not go down. If it did, the new module is broken. Fix it before adding the next one.
-
-Order:
-1. Temporal decay (replaces the simple 0.99/0.01 EMA in update)
-2. Weber-Fechner precision (replaces uniform weighting on features)
-3. Proprioception (adds body state tracking alongside GMM)
-4. PFC temperature (replaces `max(0.5, ...)` hack with proper FE-normalized temperature)
-5. Survival alpha (adds urgency scaling on top of PFC temperature)
-6. Superior colliculus + saccades (replaces simple grayscale with fixation-based extraction)
-7. Occipital pipeline (replaces HOG with full DoG/V1/V2/V4 stack)
-8. Visual streams (adds M/P path split)
-9. RG multi-scale (adds 3-scale feature merging)
-10. Core knowledge priors (adds Spelke biases to slot initialization)
-11. Theory theory (adds hypothesis set over GMM configs)
-12. LBM physics (replaces linear velocity prediction in forward model)
-13. Common sense (adds hippocampus gap-filling)
-14. BMR (now safe to enable because Breakout is already working)
-15. Hemifield split (adds bilateral processing)
-16. Cerebellar smoothing (replaces simple EMA with dedicated module)
-
-After adding ALL of these, the full architecture is in place. At that point, re-run the full test suite.
-
-
----
-
-## FIRST ACTION: CREATE TODO.md
-
-Before writing a single line of Python, create a file called `TODO.md` in the project root. This is your persistent task tracker. You will update it after completing each phase. It externalizes your progress so you do not lose track when the context window shifts.
-
-If you do not have a `TODO.md`, you have not started correctly. Create it now.
-
-The initial `TODO.md` must look exactly like this:
-
-```markdown
-# Primal TODO
-
-Generated by agent at start of task. Updated after each phase with actual results.
-
-## Status key
-- [ ] Not started
-- [~] In progress
-- [x] Done - criteria met (paste actual terminal output as proof)
-- [!] Done - criteria NOT met (paste actual output, describe what is wrong)
-
----
-
-## Phase -1: Minimum Viable Agent
-- [ ] Simple feature extractor (frame diff + downsample, no Gabor)
-- [ ] Log-space GMM with growing slots and slot velocity
-- [ ] Forward model: predict_next_state() and get_action_values()
-- [ ] Action generation with EMA smoothing, episode reset
-- [ ] MVP Breakout test: ep2 score >= 5, paddle_alignment > 0.45, it/s >= 30
-- [ ] MVP MNIST test (HOG features): accuracy > 70% on 10,000 samples
-
-MVP Breakout result (paste actual terminal output):
-```
-[PASTE HERE]
-```
-
-MVP MNIST result (paste actual terminal output):
-```
-[PASTE HERE]
-```
-
----
-
-## Phase 0: Math verification
-- [ ] verify_math.py written
-- [ ] Check 1: FE lower for correct predictions
-- [ ] Check 2: Log-space E-step numerically stable
-- [ ] Check 3: E-step responsibilities sum to 1
-- [ ] Check 4: BMR reduces component count
-- [ ] Check 5: LBM mass conservation
-- [ ] Check 6: Temporal decay converges
-- [ ] Check 7: Weber-Fechner monotone
-- [ ] Check 8: Hemifield pull asymmetric
-- [ ] Check 9: RG features differ across scales
-- [ ] Check 10: Proprioception uncertainty decreases
-- [ ] Check 11: Forward model produces different action values
-- [ ] Check 12: Cerebellar smoothing does not collapse in 1000 steps
-
-verify_math.py output (paste actual terminal output):
-```
-[PASTE HERE]
-```
-
----
-
-## Phase 1: Core inference stack
-- [ ] temporal_decay.py (wc -l result: ___)
-- [ ] weber_fechner.py (wc -l result: ___)
-- [ ] proprioception.py (wc -l result: ___)
-- [ ] log_space_gmm.py with bmr.enabled flag (wc -l result: ___)
-- [ ] active_inference.py with forward model (wc -l result: ___)
-- [ ] bmr.py with enabled flag (wc -l result: ___)
-- [ ] All Phase 0 checks pass on actual implementations (not just standalone verify_math.py)
-
----
-
-## Phase 2: Brain mechanisms
-- [ ] occipital.py (wc -l result: ___)
-- [ ] visual_streams.py (wc -l result: ___)
-- [ ] saccades.py (wc -l result: ___)
-- [ ] superior_colliculus.py (wc -l result: ___)
-- [ ] hemifield.py (wc -l result: ___)
-- [ ] brain_mechanisms.py (wc -l result: ___)
-- [ ] survival_alpha.py (wc -l result: ___)
-- [ ] renormalization.py (wc -l result: ___)
-- [ ] cerebellar_smoothing.py (wc -l result: ___)
-
----
-
-## Phase 3: Higher cognition
-- [ ] core_knowledge.py (wc -l result: ___)
-- [ ] theory_theory.py (wc -l result: ___)
-- [ ] lbm_physics.py (wc -l result: ___)
-- [ ] common_sense.py (wc -l result: ___)
-
----
-
-## Phase 4: Wiring
-- [ ] agent.py written and wires all brain/ modules (wc -l result: ___)
-- [ ] act() pipeline verified (print action_values on 5 frames, confirm not constant)
-- [ ] update() pipeline verified (FE printed for 10 steps, confirm nonzero variation)
-
----
-
-## Phase 5: Logic tests
-- [ ] tests/test_logic.py written with all 15 pytest functions
-- [ ] pytest tests/test_logic.py -v result:
-
-```
-[PASTE HERE]
-```
-
-All 15 must show PASSED. If any fail, write what failed and fix before continuing.
-
----
-
-## Phase 5.5: Line count audit
-
-Run: `for f in primal/brain/*.py primal/agent.py; do echo "$(wc -l < $f) $f"; done`
-
-Paste result:
-```
-[PASTE HERE]
-```
-
-brain/ total: ___ lines (need >= 3000)
-project total: ___ lines (need >= 3500)
-
-If any module is below its minimum, mark it [!] and fix before Phase 6.
-
----
-
-## Phase 5.6: Speed gate
-
-Run: 200-step timing check before full Breakout episodes.
-
-Result: ___ it/s (need >= 10)
-
-If below 10:
-- [ ] Profiled with cProfile
-- [ ] LBM vectorized (no Python loops over grid cells)
-- [ ] Gabor vectorized (batch apply, no per-pixel loops)
-- [ ] Speed after fix: ___ it/s
-
----
-
-## Phase 6: Breakout mastery test
-
-Full terminal output (paste):
-```
-[PASTE HERE]
-```
-
-Results:
-- ep1 score: ___
-- ep2 score: ___ (need >= 30)
-- ep2 paddle_alignment: ___ (need >= 0.60)
-- ep2 entropy: ___ (need in [0.05, 0.80])
-- ep2 > ep1: ___ (need True)
-- it/s during episode: ___ (need >= 10)
-- RAM: ___ GB (need <= 2)
-
-All PASS? ___
-
-If any FAIL, write which one and describe debug steps taken:
-
-
----
-
-## Phase 7: MNIST mastery test
-
-Full terminal output (paste):
-```
-[PASTE HERE]
-```
-
-Results:
-- BMR disabled during learning: ___ (need True)
-- novelty_threshold set to 0.0: ___ (need True)
-- slots after learning: ___ (need 10)
-- pairwise cosine similarity max: ___ (need < 0.98)
-- accuracy on 10,000 samples: ___ (need >= 0.90)
-- unknown-class handling: did not crash? ___
-
-All PASS? ___
-
-If any FAIL, write which one and describe debug steps taken:
-
-
----
-
-## Phase 8: Documentation
-- [ ] README.md written
-- [ ] LICENSE written with Primeval Company name
-- [ ] pyproject.toml complete, pip install -e . works
-
----
-
-## Final self-audit
-
-Run the wc -l loop one more time and paste here:
-```
-[PASTE HERE]
-```
-
-All checklist items in AGENTS.md checked? ___
-
-Task is complete only when every phase above shows [x] with actual terminal output pasted.
-```
-
----
-
-## Rules for updating TODO.md
-
-1. **Update TODO.md after finishing each phase, not at the end.** If you finish Phase 1 and jump straight to Phase 2 without updating TODO.md, you have lost the record of what was done and will repeat work or skip gates.
-
-2. **Paste actual terminal output, not expected output.** Every result field says "paste actual terminal output." Do not write what you expect it to say. Run the command and paste the real output.
-
-3. **If a phase fails, mark it [!] and write what failed.** Do not silently re-run and paste new output that passes. Document the failure. This is how you track whether a fix actually worked.
-
-4. **Never mark a phase [x] if its criteria were not met.** If Breakout ep2 score is 8 and the target is 30, mark it [!], not [x]. The target did not change.
-
-5. **If you are unsure which phase you are on, open TODO.md and read it.** The state is in the file. Your context window is not reliable across long tasks.
-
-6. **TODO.md is a deliverable, not a scratchpad.** It must be present in the final project alongside the code. It proves the implementation was verified at each step.
-
----
-
-## WARNING: READ THIS BEFORE WRITING A SINGLE LINE OF CODE
-
-The previous attempt at this task failed because the agent:
-- Wrote thin stub modules (total codebase under 2000 lines for 20 modules)
-- Accepted score=0.0 in Breakout as a pass because FE was decreasing
-- Accepted entropy=0.000 as "the agent became decisive" instead of recognizing it as action collapse
-- Moved to the next phase without meeting the current phase's hard criteria
-- Got blocked on a pandas dependency for MNIST and did not use the fallback
-
-Do not repeat these mistakes.
-
-**Score=0.0 in Breakout means the paddle never touched the ball. That is not learning. The target is >= 30, not > 0. Fix it before moving on.**
-
-**Entropy=0.000 means the agent picks the same action every single step. That is a bug, not a sign of learning. Entropy collapse means action generation is broken: either the temperature is near zero, the GMM is producing identical predictions for all actions, or the cerebellar smoothing has locked onto one action. Fix it before moving on.**
-
-**If your total brain/ folder is under 1500 lines, you have not implemented all 19 modules. Count the lines. Audit each file.**
-
-**If you do not have a TODO.md with actual results pasted in, you have no proof any phase was completed correctly. Create it before writing any code. Update it after every phase.**
-
-**If MNIST fails due to pandas, use the urllib fallback in the Definition of Done section. Do not skip MNIST.**
-
-The Definition of Done section at the bottom of this file has a checklist. Run through it before claiming the task is complete.
-
-**Known failure modes from previous attempt (do not repeat these):**
-
-1. Smoke run of 150 steps passed off as a Breakout episode. 150 steps is not an episode. Run full episodes until the game ends (lives exhausted). No max_steps below 10,000.
-
-2. it/s = 2.20 (5x below requirement). LBM had Python loops over grid cells. Gabor was applied pixel by pixel. Both must be fully vectorized numpy operations. Run the speed gate before Phase 6 and fix it first.
-
-3. MNIST: 2 slots opened instead of 10. BMR was running during the 10-sample learning phase and merged digit prototypes. Set `agent.bmr.enabled = False` before the learning phase. Set `agent.gmm.novelty_threshold = 0.0` to force new slot creation for each sample. Verify slot count == 10 before running classification.
-
-4. Accuracy = 0.1009 on MNIST. This is random guessing. It is a direct consequence of having only 2 slots. Fix the slot count first. If slot count is 10 and accuracy is still below 0.5, the visual features are collapsing (DoG returning zeros, PCA too low-dimensional, or Gabor applied to wrong input).
-
----
-
-## ANTI-LAZINESS RULES
-
-These rules exist because the previous attempt produced stubs, skipped tests, and called score=0 a success. Read them now.
-
-### Rule 1: No stub functions
-
-Every function must do the actual work. No exceptions.
-
-```python
-# FORBIDDEN - this is a stub:
-def update_gmm(self, obs):
-    pass
-
-# FORBIDDEN - this is a stub with a return:
-def compute_fe(self, obs):
-    return 0.0
-
-# FORBIDDEN - this is a TODO:
-def e_step(self, obs):
-    # TODO: implement log-space E-step
-    return np.ones(self.n_components) / self.n_components
-
-# REQUIRED - this is an implementation:
-def e_step(self, obs):
-    log_resp = np.array([
-        self.log_pi[k] + self._log_gaussian(obs, self.mu[k], self.Sigma_inv[k], self.log_det_Sigma[k])
-        for k in range(self.n_components)
-    ])
-    log_resp -= scipy.special.logsumexp(log_resp)
-    return np.exp(log_resp)
-```
-
-If you write a stub and move on, you are not implementing the framework. You are writing a skeleton that will fail every test and produce score=0 in Breakout.
-
-### Rule 2: Count your lines before moving to the next phase
-
-After implementing each module, run `wc -l primal/brain/<module>.py`. If it is below the minimum for that module, you are not done with it. Go back.
-
-Do not batch-verify at the end. Check each module as you finish it.
-
-### Rule 3: Every brain module must be independently testable
-
-After writing each file, write a quick `if __name__ == "__main__"` block at the bottom that runs a sanity check on that module with synthetic data and prints a PASS or FAIL. This is not the Phase 5 test suite, it is a fast individual module check.
-
-Example for `log_space_gmm.py`:
-```python
-if __name__ == "__main__":
-    import numpy as np
-    gmm = LogSpaceGMM(feature_dim=4, max_components=10)
-    obs = np.random.randn(4)
-    fe_before = gmm.compute_fe(obs)
-    gmm.update(obs)
-    fe_after = gmm.compute_fe(obs)
-    assert fe_after < fe_before, f"FE did not decrease: {fe_before:.4f} -> {fe_after:.4f}"
-    print("PASS: GMM update decreases FE on seen observation")
-```
-
-If this check fails after you write the module, the module is broken. Fix it before writing the next one.
-
-### Rule 4: Do not move phases when a phase has unresolved failures
-
-The phase gate is a hard wall, not a suggestion. If Phase 5 logic tests have 3 failures, you do not run Breakout. You fix the 3 failures first. If you start running Breakout before all 15 tests pass, you are wasting time: the broken module will cause random behavior in the game and you will debug the wrong thing.
-
-### Rule 5: Breakout score < 30 is not a partial success
-
-Score of 5, 10, or 15 with no upward trend from episode 1 is not "getting closer." It is a broken action pipeline with occasional noise. Do not accept it. Do not write README. Fix the action pipeline.
-
-The specific failure mode to check: if score is in the range 1-15 but not improving, print paddle_alignment. If alignment is below 0.4, the agent is not tracking the ball. The visual streams M-path is not feeding ball position into action selection correctly.
-
-### Rule 6: All printed results must come from actual execution
-
-Do not write print statements that output hardcoded expected values. Every number printed must come from actually running the code.
-
-```python
-# FORBIDDEN:
-print("PASS: ep2 score >= 30")  # hardcoded, not from actual game run
-
-# REQUIRED:
-ep2_score = run_episode(agent, env)
-status = "PASS" if ep2_score >= 30 else "FAIL"
-print(f"{status}: ep2 score = {ep2_score:.1f} (need >= 30)")
-```
-
-### Rule 7: When stuck, diagnose before changing random things
-
-If Breakout score is not improving, do not start randomly tweaking hyperparameters. Diagnose in this order:
-1. Print slot count per frame. Is the ball being tracked as a separate slot from the paddle?
-2. Print action_values for all 4 actions. Are they meaningfully different?
-3. Print paddle_alignment. Is the paddle moving toward the ball at all?
-4. Print temperature. Is it sane (between 0.1 and 10.0)?
-
-Each of these narrows down which module is broken. Only change hyperparameters after you know which module is producing wrong outputs.
-
----
-
-## Installation and environment setup
-
-### pyproject.toml
-
-```toml
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[project]
-name = "primal"
-version = "0.1.0"
-description = "A lightweight sub-symbolic cognitive agent framework by Primeval Company"
-readme = "README.md"
-license = { file = "LICENSE" }
-requires-python = ">=3.10"
-dependencies = [
-    "numpy>=1.26",
-    "scipy>=1.12",
-    "ale-py>=0.9",                   # ROMs are bundled inside the package as of 0.9. No AutoROM needed.
-    "gymnasium[atari]>=1.0",         # The [atari] extra pulls in ale-py wrappers. ROMs come with ale-py itself.
-    "scikit-learn>=1.4",             # Only used for MNIST dataset loading (sklearn.datasets.fetch_openml)
-    "psutil>=5.9",                   # RAM and CPU usage tracking
-    "opencv-python-headless>=4.9",   # Fast image ops (resize, Gabor). Headless avoids display dependencies.
-    "tqdm>=4.66",                    # Progress bars for test runs
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-benchmark",
-]
-
-[tool.hatch.build.targets.wheel]
-packages = ["primal"]
-```
-
-### Why no AutoROM and no accept-rom-license
-
-As of `ale-py >= 0.9`, all Atari ROMs ship inside the pip wheel itself. You no longer need the `AutoROM` package, the `AutoROM.accept-rom-license` package, or the `gymnasium[accept-rom-license]` extra. That extra was removed from Gymnasium entirely when ale-py bundled the ROMs. Installing `ale-py>=0.9` is all that is needed.
-
-The one thing that changed in Gymnasium 1.0: environments are no longer registered automatically behind the scenes. You must explicitly register them at the top of any script that uses Atari:
-
-```python
-import gymnasium as gym
-import ale_py
-
-gym.register_envs(ale_py)  # registers ALE/Breakout-v5, ALE/Pong-v5, and all others
-env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
-```
-
-If you see `gymnasium.error.NameNotFound: Environment ALE/Breakout-v5 not found`, you forgot `gym.register_envs(ale_py)`.
-
-**References to search for more detail:**
-- ALE ROM bundling and registration changes: https://ale.farama.org/release_notes/index.html (search "ROMs are packaged within the PyPI installation")
-- Gymnasium 1.0 release notes: https://gymnasium.farama.org/gymnasium_release_notes/index.html
-- ale-py PyPI page: https://pypi.org/project/ale-py/
-- AutoROM (legacy, for historical reference only): https://github.com/Farama-Foundation/AutoROM
-- ALE Gymnasium environment docs: https://gymnasium.farama.org/environments/atari/
-
----
-
-## Core ideas (read this before writing any code)
-
-These are engineering-useful abstractions, not full neuroscience replications. Take the output and the function, not the full biological computation. The test for each one: does it produce the engineering benefit cheaply?
-
----
-
-### 1. Active Inference (the only two moves)
-
-The whole framework is built on two operations:
-
-- "Change the world to match your prediction" = **action** (active inference)
-- "Change your prediction to match the world" = **perception** (passive inference)
-
-Free Energy (FE) = surprise = prediction error. The agent always minimizes FE.
-
-**Perception update:** Given observation `o` and current belief `q(s)`, update `q(s)` to reduce `FE = E_q[log q(s) - log p(s,o)]`. In practice this is a precision-weighted prediction error signal added to the current mean.
-
-**Action generation:** Select action `a` that minimizes expected FE under the current generative model. Because we skip full VI planning (too slow), action selection uses a softmax over predicted FE reduction for each available action, computed from the current GMM state.
-
-**Predictive coding:** The generative model produces a top-down prediction. The residual between prediction and observation is the prediction error. Positive prediction errors (observation exceeded prediction) and negative ones carry opposite update signs. Precision weights the error before it updates the belief.
-
-**What to skip:** Full Variational Inference planning (POMDP rollouts, belief propagation over future states). This is what Friston's later work expanded into and it is expensive. The core idea is the two moves above. Take that and nothing more from AIF.
-
-**FE formula in log space:** `FE = -log p(o | mu) - log p(mu) + log q(mu)`. For a Gaussian generative model this simplifies to `0.5 * precision * (o - mu)^2 + log_Z`. Compute this per GMM component, then mix by responsibility.
-
-**Search for more:** "Karl Friston free energy principle predictive coding tutorial" and "active inference tutorial Parr Friston 2022"
-
----
-
-### 2. Log-space GMM with growing components (slot-centric)
-
-All belief updates happen in log space. This is not an optimization choice, it is a correctness choice: probabilities near zero underflow in float32 if you work in linear space.
-
-**E-step (responsibility):**
-```python
-log_r_k = log_pi_k + log_N(x; mu_k, Sigma_k)
-log_r_k -= logsumexp(log_r_k)   # normalize
-r_k = exp(log_r_k)
-```
-
-**M-step (update):**
-```python
-N_k = sum(r_k)
-mu_k = sum(r_k * x) / N_k
-Sigma_k = sum(r_k * outer(x - mu_k, x - mu_k)) / N_k + eps * I
-log_pi_k = log(N_k) - log(sum(N_k))
-```
-
-Run E-step every timestep. Run M-step every 10 steps or when FE spikes above 2x running mean.
-
-**Growing components:** If `max_k(r_k)` for the current observation is below `novelty_threshold` (start with 0.1), open a new slot initialized at the current observation with high variance (`Sigma = 10 * I`). This is Bayesian Model Expansion. Component count is not fixed.
-
-**Slot-centric:** Each component is a slot that tracks one entity (one object, one digit pattern). Slots compete for each observation via responsibilities. Slots that consistently win on similar observations specialize.
-
-**Never forget:** Components accumulate observations via the running M-step. They are only removed by BMR (see section 5), never by age or timeout.
-
-**Conjugate prior:** Use Normal-Wishart prior for each component so the M-step is a closed-form posterior update. This keeps the fusion exact rather than approximate.
-
-**Search for more:** "Normal-Wishart conjugate prior Bayesian GMM" and "online EM algorithm Gaussian mixture model"
-
----
-
-### 3. Core Knowledge (Spelke's 5 systems as inductive biases)
-
-Spelke's 5 core knowledge systems are not hardcoded rules. They are inductive biases baked into how the GMM initializes, what precision it assigns to different prediction errors, and how slots grow and compete. None of them name anything. They do not say "this is a ball" or "this is a digit." They shape the statistical geometry of belief space so the agent does not start from a completely flat prior.
-
-The engineering principle for each system: **what output does this system produce in infants, and what is the cheapest function that replicates that output in the GMM?**
-
----
-
-#### System 1: Objects
-
-**What infants know:** Objects are cohesive (they move as a whole, not as disconnected patches), continuous (they trace a path, they do not teleport), and contact-constrained (they only affect each other by touching). Infants as young as 3 months look surprised when an object appears on the wrong side of an occluder without passing through it.
-
-**Engineering output:** When a new observation arrives, check whether any existing slot can plausibly claim it by continuity. "Plausibly" means: does the observation fall within `k` standard deviations of the slot's predicted next position, where `predicted = mu_prev + velocity_prev`? If yes, assign to that slot. If no slot can claim it, open a new one.
-
-**How it works in code:**
-
-```python
-predicted_means = [mu_k + velocity_k for each slot k]
-distances = [mahalanobis(x, pred_mu_k, Sigma_k) for each k]
-best_k = argmin(distances)
-if distances[best_k] < continuity_threshold:   # e.g., 3.0 sigma
-    assign x to best_k, run normal E-step
-else:
-    open new slot at x with Sigma = 10*I
-```
-
-This is object permanence without naming objects. The agent naturally treats things that move continuously as the same thing over time.
-
-**Cohesion prior:** Group observations within `cohesion_radius` pixels before slot assignment. Observations close together are treated as one entity. A tall paddle is tracked as one slot, not 80 independent pixels.
-
-**Contact constraint:** If two slot means converge within `contact_threshold` of each other and both have nonzero velocity, apply an elastic collision update to their velocities. This is coordinated with the LBM module (section 10), but the contact trigger originates here in core_knowledge.
-
----
-
-#### System 2: Agents (goal-directed, self-propelled entities)
-
-**What infants know:** Some things move on their own, toward goals, and by efficient paths. Agents are distinguished from objects by self-propulsion: their velocity cannot be explained by external physics. Infants at 12 months attribute goals to moving agents and expect them to take the shortest available path.
-
-**Engineering output:** A slot is flagged as an agent slot if its velocity over the last 10 steps consistently exceeds what LBM physics would predict. Residual velocity (observed minus LBM-predicted) above `agent_threshold` means self-propulsion.
-
-**How it works in code:**
-
-```python
-residual_k = velocity_k_observed - velocity_k_lbm_predicted
-is_agent_k = rolling_mean(np.abs(residual_k), window=10) > agent_threshold
-
-# Agent slots get higher weight in action-prediction:
-action_relevance_k = base_weight + agent_bonus if is_agent_k else base_weight
-```
-
-**Goal inference:** Agent slots maintain a goal estimate: the location the slot appears to be moving toward, inferred by extrapolating its velocity. Updated each step. When the Primal agent selects an action, it estimates the expected change in distance between its own proprioceptive state and each agent slot's goal. This drives purposive action without naming what the goal is.
-
-**Why this matters universally:** In Breakout, the ball becomes an agent slot after paddle contact (its motion is no longer explained by simple physics). In MNIST, nothing moves, so no agent slots open, which is correct. In robotic control, the end-effector is an agent slot. The flagging is automatic and requires no domain knowledge.
-
----
-
-#### System 3: Number (Approximate Number System, ANS)
-
-**What infants know:** Infants can distinguish "more" from "less" without counting. At 6 months they habituate to arrays of 8 dots and look longer at 16-dot arrays than 8-dot arrays in a new arrangement. The discrimination follows Weber's law: 8 vs 16 is easy (2:1 ratio), 8 vs 9 is hard (9:8 ratio). The resolution is logarithmic, not linear.
-
-**Engineering output:** Track the log-cardinality of active slots (those with `pi_k > weight_floor`). A sudden change in log-cardinality adds a surprise bonus to FE.
-
-**How it works in code:**
-
-```python
-active_slots = [k for k in slots if pi_k > weight_floor]
-log_card = np.log1p(len(active_slots))   # log1p for numerical stability
-delta_log_card = abs(log_card - log_card_prev)
-
-if delta_log_card > cardinality_change_threshold:
-    FE_total += cardinality_surprise_weight * delta_log_card
-```
-
-The FE bonus triggers homeostasis (potential model expansion) and hippocampus replay (the event is surprising, so remember it).
-
-**Weber scaling of cardinality:** Use `weber_precision(n_active)` to weight the surprise. Going from 1 slot to 2 is very surprising. Going from 20 to 21 is not. This matches infant data where small number discrimination is sharper than large number discrimination.
-
-**Why this matters universally:** In Breakout, bricks disappearing reduces cardinality and triggers surprise. In multi-agent environments, new agents appearing increases cardinality. In financial time series, a sudden new cluster of price behavior triggers cardinality surprise. None of this requires naming what the entities are.
-
----
-
-#### System 4: Space and Geometry
-
-**What infants know:** Space is Euclidean. Objects have locations. Infants use geometric properties (distance, left/right, in front/behind) to navigate and to find hidden objects. They know "behind the wall" is different from "in front of the wall." By 18 months, they use the shape of a room's walls to reorient themselves after being spun around.
-
-**Engineering output:** Every slot carries (x, y) as mandatory first dimensions of its mean vector, regardless of domain. Spatial dimensions receive higher precision than other feature dimensions by default. Distance and direction between slots are first-class quantities used in slot assignment, contact detection, goal inference, and action selection.
-
-**How it works in code:**
-
-```python
-# Slot mean: [x, y, feature_1, ..., feature_d]
-precision_weights = np.ones(feature_dim)
-precision_weights[0] = spatial_precision_boost   # e.g., 3.0
-precision_weights[1] = spatial_precision_boost
-
-# Weighted Mahalanobis for slot assignment:
-diff = x - mu_k
-fe_k = 0.5 * (diff * precision_weights) @ inv_Sigma_k @ diff
-```
-
-**Geometry prior on new slots:** Initial spatial variance for a new slot is `sigma_xy^2 = (frame_width / 10)^2`. This encodes the prior that objects are probably somewhere in the frame, but uncertain within a region roughly 1/10th of the frame wide.
-
-**Containment:** If a slot's mean is within the bounding box of another slot (approximated as mean plus/minus 2 std), flag it as "contained." Contained slots inherit a component of the outer slot's velocity. This implements the intuition that an object inside a container moves with the container.
-
-**Allocentric vs egocentric frames:** The GMM maintains two reference frames. Allocentric uses absolute frame coordinates. Egocentric uses coordinates relative to the agent's own proprioceptive center. Action selection uses the egocentric frame. Object tracking and memory use the allocentric frame. Transform between them using the proprioception module.
-
-**Why this matters universally:** Every domain with spatial or positional structure benefits from treating coordinates as high-precision first-class dimensions. For MNIST, (x, y) of stroke features index into digit topology. For Breakout, (x, y) track game objects. For 1D time series, a single position dimension along the time axis serves the same role.
-
----
-
-#### System 5: Social Partners (agents that respond contingently to you)
-
-**What infants know:** Some agents are special: they attend to you, respond to your actions, and have intentions directed at you. By 9 months, infants follow gaze, engage in joint attention, and attribute communicative intent to agents that respond contingently to their behavior. The key detection cue is contingency: the other agent's behavior changes reliably in response to mine, with a short lag.
-
-**Engineering output:** A slot is flagged as a social slot if its behavior is statistically contingent on the agent's own actions over the last 20 steps. Contingent means: the slot's velocity or position changes reliably after the agent acts, with a lag of 1-3 steps.
-
-**How it works in code:**
-
-```python
-for slot k in agent_slots:
-    action_vec = one_hot(action_history[-20:])    # shape: (20, n_actions)
-    slot_vel   = slot_velocity_history_k[-20:]    # shape: (20, 2)
-    for lag in [1, 2, 3]:
-        corr = np.corrcoef(
-            action_vec[:-lag].flatten(),
-            slot_vel[lag:].flatten()
-        )[0, 1]
-        if abs(corr) > social_threshold:          # e.g., 0.4
-            flag slot k as social
-```
-
-**Reciprocity prior:** Social slots get a separate expected-response prediction. When the agent acts, it predicts what the social slot will do next (1-3 steps ahead). Prediction error on this response updates the expectation. Over time, the agent builds a model of how to influence the social slot. This is proto-communication and proto-strategic reasoning, fully sub-symbolic.
-
-**Why this matters universally:** In Pong, the opponent paddle is a social slot: it responds contingently to the ball's position, which is influenced by the agent's own paddle. In multi-agent RL, other agents are social slots. In a dialogue environment where text is the observation, the responding system is a social slot. In Breakout, nothing is a social slot (nothing responds to the agent with a lag). The detection is purely statistical and domain-free.
-
----
-
-None of these 5 systems name anything. They carry no string labels, no hardcoded domain knowledge, no task-specific logic. They are precision biases, initialization strategies, and slot-flagging rules that emerge automatically from the statistical structure of any sequential observation stream.
-
-**Search for more:** "Elizabeth Spelke core knowledge systems 2007 review", "core knowledge object permanence infant cohesion continuity", "approximate number system ANS Weber law infants", "goal attribution infant agents efficiency 12 months", "geometric reorientation infant spatial cognition room shape", "joint attention 9 month infants social contingency"
-
-
----
-
-### 4. Theory Theory (cheap multi-hypothesis selection)
-
-The agent maintains a small set H (start with H=4, max H=12) of hypotheses. Each hypothesis is a configuration of the GMM: which slots are active, what their means and variances are, what causal structure connects them.
-
-Each timestep:
-1. Each hypothesis generates a prediction.
-2. Each hypothesis scores itself by `log p(o | h_i)`.
-3. Hypothesis weights update: `w_i = w_i * p(o | h_i) / sum(w_j * p(o | h_j))`.
-4. The MAP hypothesis (argmax w_i) drives the next prediction and action.
-
-This is Bayesian Model Selection over a small set. It is not full VI. The cost is O(H) per step, which is cheap.
-
-New hypotheses are generated by perturbation: take the MAP hypothesis, add small noise to means and variances, and create H-1 variants. Prune hypotheses whose weight falls below `1/H^2`. Generate new variants from the current MAP when the set shrinks below H/2.
-
-**Search for more:** "Bayesian model selection AIC BIC model evidence" and "Alison Gopnik theory theory children as scientists"
-
----
-
-### 5. Bayesian Model Reduction (BMR)
-
-BMR runs on a schedule (every 100 steps by default). It does two things:
-
-**Merge:** Compare every pair of components by symmetric KL divergence. If `KL(k1 || k2) + KL(k2 || k1) < merge_threshold` (e.g., 0.5), merge them. Merged component mean: `mu = (N_1 * mu_1 + N_2 * mu_2) / (N_1 + N_2)`. Merged covariance: use the parallel covariance formula (involves the outer product of the mean difference).
-
-**Prune:** Remove any component with `pi_k < prune_threshold` (e.g., 0.01). After pruning, renormalize weights.
-
-**KL divergence between two Gaussians (closed form):** `KL(p||q) = 0.5 * (tr(Sigma_q^-1 @ Sigma_p) + (mu_q - mu_p)^T @ Sigma_q^-1 @ (mu_q - mu_p) - d + log(det(Sigma_q) / det(Sigma_p)))`. Use log-det for numerical stability.
-
-**Search for more:** "Karl Friston Bayesian Model Reduction 2016 paper" and "KL divergence Gaussians closed form"
-
----
-
-### 6. Brain mechanisms (engineering abstractions only)
-
-The rule for every mechanism here: implement the output function, not the biological computation. What does this mechanism produce, and what is the simplest function that produces that output?
-
-#### PFC / vlPFC: Temperature control
-
-PFC modulates the sharpness of distributions based on prediction error. High FE = uncertain, explore. Low FE = confident, exploit.
-
-```python
-temperature = base_temp * np.exp(alpha * FE_normalized)
-action_probs = softmax(action_values / temperature)
-```
-
-`FE_normalized = FE_current / FE_running_mean`. Temperature is relative to what is "normal" for this agent. Start with `base_temp = 1.0`.
-
-#### Retina: Foveal weighting
-
-The fovea has roughly 10x higher cone density than the periphery. Implement as a 2D Gaussian weight map centered at the current fixation point:
-
-```python
-foveal_weight = gaussian_2d(H, W, center=fixation_xy, sigma=H/4)
-weighted_input = input_frame * foveal_weight
-```
-
-Apply per fixation. With 3 fixations per frame (from saccades module), you get 3 differently weighted versions of the input.
-
-#### Hippocampus: Episodic buffer
-
-A circular buffer of `(observation_features, action, FE, timestamp)` tuples. Default size: 1000 entries.
-
-Two uses:
-1. **High-FE replay:** Events with FE above the 90th percentile get resampled during M-step. This biases learning toward surprising events.
-2. **Common sense gap-filling:** When current FE is too high but the agent must act, retrieve the nearest buffer entry by cosine similarity on V4 features and use its action.
-
-Write every step. Read on high-FE events and during gap-filling.
-
-#### V1/V2/V4 visual cortex hierarchy
-
-V1: oriented edge detection via 24 precomputed Gabor filters (8 orientations x 3 spatial frequencies). Apply via convolution on DoG output.
-
-V2: junction detection. For each spatial location, multiply Gabor responses at orthogonal orientations. High product = junction, T-bar, cross.
-
-V4: curvature and shape fragments. 3x3 max pooling over V2 responses, plus 3x3 average pooling over V1 magnitudes. Concatenate.
-
-Feed V4 output into the GMM, not raw V1. V4 is much more informative for both digit identity and object tracking.
-
-#### Anterior temporal lobe: Category abstraction
-
-Maps V4 features to GMM component indices via E-step responsibility. The "category" is the slot index, not a name.
-
-#### Inferior temporal cortex: Contrastive sharpening
-
-After each E-step, move component means slightly away from each other:
-
-```python
-for k in range(n_components):
-    for j in range(n_components):
-        if j != k:
-            diff = mu_k - mu_j
-            dist = np.linalg.norm(diff)
-            mu_k += contrast_rate * diff * np.exp(-dist)
-```
-
-This prevents components from collapsing toward each other. Start with `contrast_rate = 0.01`.
-
-#### Homeostasis
-
-Running exponential mean of FE: `FE_mean = 0.99 * FE_mean + 0.01 * FE_current`.
-
-If `FE_current / FE_mean > 2.0` for more than 10 consecutive steps: trigger GMM expansion (open new slot).
-
-If `FE_current / FE_mean < 0.5` for more than 50 steps: trigger BMR (model is overfit, clean up).
-
-#### Hemisphere / bilateral hemifield
-
-Split input frame into left and right halves. Run full visual pipeline on each half independently. Merge at action selection by concatenating both feature vectors.
-
-Weight each hemifield by its FE: the hemifield with higher FE gets higher weight in the merged representation. Rationale: the more surprising side is more task-relevant.
-
----
-
-### 7. Weber-Fechner / ANS precision scaling
-
-The brain's precision on a quantity scales logarithmically with magnitude. A difference of 1 near zero feels huge. A difference of 1 near 100 feels tiny.
-
-```python
-def weber_precision(x, alpha=1.0):
-    return alpha / (np.log1p(np.abs(x)) + 1e-8)
-```
-
-Weight prediction errors by `weber_precision(observation_value)` before updating beliefs. Apply this to raw pixel values (0-255), coordinate values, and all scalar features.
-
-**Search for more:** "Weber-Fechner law psychophysics" and "approximate number system ANS logarithmic compression"
-
----
-
-### 8. Hemifield pull imbalance
-
-Compute a saliency-weighted centroid for each hemifield:
-
-```python
-left_pull  = weighted_centroid(saliency_map[:, :W//2])
-right_pull = weighted_centroid(saliency_map[:, W//2:])
-left_sal   = saliency_map[:, :W//2].sum()
-right_sal  = saliency_map[:, W//2:].sum()
-
-fixation_x = (left_sal * left_pull_x + right_sal * right_pull_x) / (left_sal + right_sal)
-```
-
-This is why humans look at the more visually interesting side first. It also prevents the agent from ignoring the side of the screen where the ball is.
-
----
-
-### 9. Precision alpha for survival urgency
-
-`alpha` is the global precision scale. High alpha = sharper, more decisive predictions. Low alpha = softer, more exploratory.
-
-```python
-urgency = np.clip(1.0 - reward_running_mean / max_possible_reward, 0.0, 1.0)
-alpha   = alpha_min + (alpha_max - alpha_min) * urgency
-```
-
-When the agent is losing (lives lost, negative rewards), urgency is high, alpha is high, and the agent is more decisive. When things are going well, alpha drops and the agent explores. Start with `alpha_min=0.5`, `alpha_max=3.0`.
-
----
-
-### 10. Lattice-Boltzmann fluid advection (D2Q9, 18 steps)
-
-LBM is used as a cheap physics prior, not a learned model. It advects a "presence density field" one frame forward using fluid dynamics.
-
-**D2Q9:** 2D grid, 9 velocity directions (center + 4 cardinal + 4 diagonal).
-
-Velocity vectors: `{(0,0), (1,0), (0,1), (-1,0), (0,-1), (1,1), (-1,1), (-1,-1), (1,-1)}`
-Weights: `{4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36}`
-
-**One LBM step:**
-1. Streaming: shift `f_i` (distribution for direction i) by its velocity vector using `np.roll`.
-2. Collision (BGK): `f_i_new = f_i - (f_i - f_i_eq) / tau`, where `tau=0.6` for stability.
-
-Equilibrium distribution: `f_i_eq = w_i * rho * (1 + 3*(e_i . u) + 4.5*(e_i . u)^2 - 1.5*|u|^2)`
-
-Where `rho` is local density (sum of f_i at each cell), `u` is local velocity (momentum / density).
-
-Run 18 steps per frame to get a stable one-frame lookahead.
-
-**Boundary conditions:** Use bounce-back at frame edges. A distribution function heading toward a wall reflects to the opposite direction. This naturally handles ball-wall bounces in Breakout without any hardcoded wall logic.
-
-**Mass conservation:** `sum(f over all directions and all cells)` must be constant before and after every step. Add `assert np.isclose(mass_before, mass_after, rtol=1e-5)` in dev mode.
-
-**Vectorization requirement (non-negotiable):**
-
-The entire LBM step must run in vectorized numpy operations. No Python loops over grid cells. The streaming step uses `np.roll`. The collision step uses array-wise arithmetic on the full `f[9, H, W]` array. A correctly vectorized 18-step LBM on a 210x160 grid runs in under 3ms on a modern CPU. If your LBM step is taking 50ms, you have Python loops inside it. Find them and remove them.
-
-```python
-# FORBIDDEN (Python loop over grid):
-for x in range(W):
-    for y in range(H):
-        f[i, y, x] = f[i, y, x] - (f[i, y, x] - feq[i, y, x]) / tau
-
-# REQUIRED (fully vectorized):
-f -= (f - feq) / tau   # collision: entire 9xHxW array at once
-for i, (dy, dx) in enumerate(velocities):
-    f[i] = np.roll(np.roll(f[i], dy, axis=0), dx, axis=1)  # streaming
-```
-
-**Search for more:**
-- "D2Q9 lattice Boltzmann weights velocities" at Wikipedia or http://wiki.palabos.org
-- "lattice Boltzmann BGK collision operator"
-- "lattice Boltzmann bounce-back boundary condition"
-
----
-
-### 11. Proprioception: continuous Gaussian body state
-
-The agent's own state (estimated position, velocity, action history) is tracked as a continuous Gaussian.
-
-```python
-# State: [x, y, vx, vy]
-# Prediction step (constant velocity model):
-F = [[1,0,1,0],[0,1,0,1],[0,0,0.9,0],[0,0,0,0.9]]
-mu_prior = F @ mu_prev
-P_prior  = F @ P_prev @ F.T + Q  # Q = process noise, start with 0.1*I
-
-# Update step (Kalman):
-K      = P_prior @ H.T @ inv(H @ P_prior @ H.T + R)
-mu_post = mu_prior + K @ (obs - H @ mu_prior)
-P_post  = (I - K @ H) @ P_prior
-```
-
-`R` is observation noise covariance (start with `0.1 * I`). `H` projects state to observation.
-
-Proprioception uncertainty `trace(P_post)` feeds into survival alpha: higher uncertainty = higher urgency.
-
-**Search for more:** "Kalman filter equations tutorial" and "extended Kalman filter robotics"
-
----
-
-### 12. Markovian temporal decay
-
-Prior at time t: `p_t = 0.7 * p_{t-1} + 0.3 * likelihood_t`
-
-Applied per GMM component during M-step: blend new sufficient statistics with old at 0.3/0.7 before updating mu and Sigma. The ratio is a hyperparameter. For fast environments, lower the 0.7. For slow environments, raise it.
-
-The same 0.7/0.3 split is used in cerebellar smoothing (section 16) because the brain uses similar forgetting rates at multiple levels.
-
----
-
-### 13. Renormalization Group (multi-scale feature extraction)
-
-Run the full visual pipeline at 3 scales: original, 1/2, 1/4. For a 210x160 Atari frame: 210x160, 105x80, 53x40.
-
-At each scale, run DoG + Gabor + V2 + V4 independently.
-
-**Merging:** Weight each scale's features by inverse FE at that scale. The scale with lower FE gets higher weight.
-
-```python
-weights = softmax([-FE_scale1, -FE_scale2, -FE_scale3])
-merged  = np.concatenate([w1*feat1, w2*feat2, w3*feat3])
-```
-
-Coarse scale catches global structure. Fine scale catches local detail. The FE-weighted merge automatically adapts to which scale is more informative for the current observation.
-
-**Search for more:** "renormalization group statistical physics coarse graining" and "multi-scale feature extraction image recognition"
-
----
-
-### 14. Common Sense Reasoning (gap-filling from episodic buffer)
-
-When `FE_current > 2.0 * FE_mean` AND the current observation is partial or ambiguous:
-
-1. Compute V4 feature vector for current observation.
-2. Find top-3 buffer entries by cosine similarity on V4 features.
-3. Weighted-average their next-state predictions by similarity score.
-4. Use the averaged prediction to fill the gap in the current belief.
-
-If no buffer entry has cosine similarity above 0.5: do not gap-fill. Let the high FE propagate and trigger expansion.
-
-This is principled Bayesian interpolation, not hallucination. The agent uses the most similar past state as evidence when current evidence is weak.
-
----
-
-### 15. Slot-Centric GMM
-
-Already covered in section 2, but explicitly: each slot has `mu_k`, `Sigma_k`, `pi_k`, `age_k`, `velocity_k`.
-
-Slot velocity: `velocity_k = mu_k_current - mu_k_prev`. Estimated each M-step. Feeds into LBM as initial condition and into Spelke's object continuity prior.
-
-New slot: `pi_k = 1 / (n_slots + 1)`. Existing weights renormalized. Variance: `Sigma_k = 10 * I`.
-
----
-
-### 16. Cerebellar smoothing
-
-EMA over the action probability vector to reduce jitter:
-
-```python
-smooth_probs = 0.7 * prev_smooth_probs + 0.3 * raw_action_probs
-action = np.argmax(smooth_probs)  # or sample if exploring
-```
-
-Also smooth action logits before softmax. Never apply softmax to unsmoothed values.
-
----
-
-### 17. Superior Colliculus: Saliency map
-
-Two signals combined:
-
-```python
-contrast = np.abs(frame - uniform_filter(frame, size=5))
-motion   = np.abs(frame - prev_frame)
-saliency = 0.5 * contrast + 0.5 * motion
-saliency /= (saliency.max() + 1e-8)
-```
-
-Normalize to [0,1]. Use saliency map to drive saccadic fixation selection (top-K peaks, K=2 or 3 per frame). Also feeds into hemifield pull imbalance.
-
----
-
-### 18. Occipital lobe: Full visual pipeline
-
-This is the most detailed module because it determines whether MNIST works.
-
-**Step 1: DoG center-surround (retinal ganglion cells)**
-
-```python
-on_center  =  gaussian(frame, sigma=1.0) - gaussian(frame, sigma=3.0)
-off_center = -on_center
-```
-
-Without DoG, uniform regions (blank backgrounds) produce strong spurious Gabor responses. DoG kills them. Run both on-center and off-center channels forward.
-
-**Step 2: End-stopped cells (line endings and corners)**
-
-```python
-end_stopped = gabor(frame, theta, length=L) - 0.5 * gabor(frame, theta, length=2*L)
-```
-
-High response at stroke endings, low in the middle of strokes. Critical for MNIST digit topology (the endings of "1", "7", the loops of "6", "9").
-
-**Step 3: V1 Gabor filters (8 orientations x 3 frequencies = 24 filters)**
-
-Precompute all 24 kernels at init time. Never recompute. Store as a stacked array `kernels: np.ndarray` of shape `(24, kH, kW)`.
-
-**Vectorization requirement:** Apply all 24 filters in a batch, not a loop. Use `scipy.ndimage.convolve` once per filter but stack the results. Or use `cv2.filter2D` in a list comprehension. A batch of 24 Gabor convolutions on a 210x160 image should complete in under 15ms. If it is taking 200ms, you are recomputing the kernels on each frame or applying them in a Python loop with per-pixel operations.
-
-```python
-# FORBIDDEN:
-responses = []
-for kernel in self.kernels:
-    for y in range(H):
-        for x in range(W):
-            responses.append(convolve_at(frame, kernel, y, x))
-
-# REQUIRED:
-responses = np.stack([
-    scipy.ndimage.convolve(frame, k, mode="reflect")
-    for k in self.kernels   # 24 calls, each vectorized internally
-], axis=0)   # shape: (24, H, W)
-```
-
-Orientations: 0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5 degrees.
-Spatial frequencies (sigma): 4, 2, 1 pixels.
-
-Apply to DoG output.
-
-**Step 4: V2 junction detection**
-
-For each spatial location, multiply Gabor responses at orthogonal orientations:
-
-```python
-V2_junction = gabor_0deg * gabor_90deg + gabor_45deg * gabor_135deg
-```
-
-High values = junctions, T-bars, corners. Useful for digit intersections.
-
-**Step 5: V4 curvature pooling**
-
-3x3 max pooling over V2 responses, plus 3x3 average pooling over V1 magnitudes. Concatenate:
-
-```python
-V4 = np.concatenate([max_pool(V2, 3), avg_pool(V1_magnitudes, 3)], axis=-1)
-```
-
-**Step 6: Flatten and PCA reduce**
-
-Flatten V4 output. For the first 10 observations, store raw features. After 10 observations, fit PCA to 96 components. From then on, project to 96 dims before feeding to GMM. Never refit PCA after the first fit.
-
----
-
-### 19. Visual streams (Magnocellular and Parvocellular)
-
-Two parallel pathways from the start, every frame.
-
-**Magnocellular (M, dorsal "Where"):**
-- Input: low-pass filtered frame (`gaussian(frame, sigma=2)`, then 2x downsample)
-- Sensitive to motion, not fine detail
-- Output: motion energy map + coarse object positions
-- Used for: ball tracking in Breakout, paddle tracking in Pong, spatial reasoning
-- Feeds into: dorsal stream (V5/MT), then proprioception and hemifield modules
-
-**Parvocellular (P, ventral "What"):**
-- Input: high-pass = `frame - gaussian(frame, sigma=2)` (original minus M-path input)
-- Sensitive to fine detail and edge sharpness
-- Output: full occipital pipeline (DoG, end-stopped, V1/V2/V4)
-- Used for: MNIST digit identity, object category
-- Feeds into: ventral stream, then slot-centric GMM
-
-For Atari, M-path dominates action selection. For MNIST, P-path dominates classification. The GMM learns this implicitly: slots representing fast-moving objects align with M-path features; slots representing static shapes align with P-path features.
-
-**Search for more:** "magnocellular parvocellular visual pathway" and "dorsal ventral stream what where"
-
----
-
-### 20. Saccades (microsaccades and fixation sequence)
-
-**Microsaccades:** Every 5 frames, add a small random offset to fixation center:
-
-```python
-offset   = np.random.normal(0, 1.5, size=2)  # 1.5 pixel std
-fixation = np.clip(fixation + offset, margin, frame_size - margin)
-```
-
-Prevents adaptation to static stimuli. Critical for MNIST where the image does not move.
-
-**Fixation sequence (3 fixations per frame):**
-1. Current fixation (carried over from last frame, with microsaccade offset)
-2. Peak saliency location from SC map (top salient point not within 10px of fixation 1)
-3. Hemifield pull location from section 8
-
-For each fixation: apply foveal Gaussian weighting centered there, run P-path pipeline, collect V4 features. Concatenate 3 feature vectors before feeding to GMM.
-
-For MNIST: fixation sampling is crucial because digit images are not uniformly centered. The 3 fixations sample different stroke regions and merge the evidence, like a human reading handwriting.
-
----
-
-### 21. Additional mechanisms (implement these too)
-
-**Contrast gain control:** After each Gabor filter bank application, normalize each filter's response map by the local RMS energy (3x3 neighborhood). This prevents high-contrast regions from dominating low-contrast but informative regions. Formula: `response_normalized = response / (sqrt(mean(response^2 in 3x3)) + epsilon)`.
-
-**Temporal contrast:** In addition to spatial contrast, compute response to frame difference (current frame minus previous frame, filtered through the M-path Gabors). This gives the agent a dedicated "what just changed" signal separate from the "what is currently here" signal.
-
-**Surprise-gated learning:** Scale the M-step learning rate by the current normalized FE. High FE = high learning rate. Low FE = low learning rate. The agent learns faster from surprising events. Formula: `lr = base_lr * clip(FE / FE_mean, 0.1, 5.0)`.
-
-**Lateral inhibition in GMM:** After each E-step, reduce the responsibilities of components that are similar to the winning component. This sharpens competition and prevents two slots from tracking the same object. Formula: for the winning component k_win and all other k, reduce `r_k` by `inhibition_rate * exp(-KL(k, k_win))`.
-
----
-
-## File structure
-
-```
-primal/
-  brain/
-    active_inference.py       # FE computation, perception update, action generation
-    log_space_gmm.py          # Growing slot-centric GMM, E/M steps, BME, slot velocity
-    core_knowledge.py         # Spelke priors as init biases and precision weighting
-    theory_theory.py          # Hypothesis set, MAP selection, perturbation, Bayesian avg
-    bmr.py                    # KL-based merge, weight-based prune, on schedule
-    brain_mechanisms.py       # PFC temp, retina, hippocampus, ITC contrast, homeostasis
-    weber_fechner.py          # ANS precision scaling per dimension
-    hemifield.py              # Bilateral split, per-hemifield pipeline, pull merge
-    survival_alpha.py         # Urgency from reward, alpha scaling
-    lbm_physics.py            # D2Q9, 18 steps, mass conservation, bounce-back BCs
-    proprioception.py         # Kalman-like continuous Gaussian body state
-    temporal_decay.py         # Markovian 0.7/0.3 decay on priors and actions
-    renormalization.py        # 3-scale feature extraction, FE-weighted merge
-    common_sense.py           # Gap-filling from hippocampus via cosine similarity
-    cerebellar_smoothing.py   # EMA(0.7) over action probability vector
-    superior_colliculus.py    # Saliency from contrast + motion, top-K fixation peaks
-    occipital.py              # DoG, end-stopped, V1 Gabor, V2 junctions, V4 pooling, PCA
-    visual_streams.py         # M-path (dorsal) and P-path (ventral) separation
-    saccades.py               # Microsaccades, 3-fixation sequence per frame
-  agent.py                    # PrimalAgent: __init__, act, update, reset
-  __init__.py
-tests/
-  test_logic.py               # Math and logic verification, run before game tests
-  test_breakout.py            # ALE Breakout with it/s and RAM tracking
-  test_mnist.py               # MNIST 1-shot, full 10k test set
-pyproject.toml
-LICENSE
-README.md
-AGENTS.md
-```
-
----
-
-## Implementation plan (phases in order, do not skip steps)
-
-**Do Phase -1 first.** Get the MVP working before implementing brain modules. A working MVP proves the core loop (GMM + forward model + action selection) is correct. Without that proof, you debug 19 modules simultaneously and get score=0 with no way to know which module caused it.
-
-### Phase -1: Minimum Viable Agent
-
-See "PHASE -1" section above. Implement only: simple feature extraction (frame diff), GMM, forward model, action generation. No LBM, no Gabor, no brain mechanisms.
-
-MVP targets:
-- Breakout ep2 score >= 5 AND paddle_alignment > 0.45 AND it/s >= 30
-- MNIST with HOG features: accuracy > 70% on 10,000 samples
-
-Only after both pass: proceed to Phase 0.
-
-### Phase 0: Verify math before any production code
-
-Write a standalone `verify_math.py`. All 12 checks must pass before Phase 1.
-
-**Every check must have a numeric threshold that would fail if the function returns a constant.**
-
-```python
-# WRONG: crash check disguised as a math check
-def check_fe():
-    ai = ActiveInference(feature_dim=8)
-    fe = ai.compute_fe(np.zeros(8), np.zeros(8), np.eye(8))
-    assert fe is not None   # passes even if compute_fe always returns 0.0
-    print("PASS")
-
-# RIGHT: threshold that actually fails on a broken implementation
-def check_fe():
-    ai = ActiveInference(feature_dim=8)
-    mu        = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    close_obs = mu.copy()
-    far_obs   = mu + np.array([50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    Sigma_inv = np.eye(8)
-    fe_close = ai.compute_fe(close_obs, mu, Sigma_inv)
-    fe_far   = ai.compute_fe(far_obs,   mu, Sigma_inv)
-    assert fe_far > fe_close * 100, (
-        f"FAIL: FE for distant obs ({fe_far:.2f}) is not >> FE for close obs ({fe_close:.2f}). "
-        f"Expected at least 100x. Check squared Mahalanobis distance."
-    )
-    print(f"PASS: FE close={fe_close:.4f} far={fe_far:.4f} ratio={fe_far/(fe_close+1e-8):.0f}x")
-```
-
-1. **FE is lower for correct predictions.** Generate Gaussian mu=5, sigma=1. Assert `FE(obs=5.0) < FE(obs=15.0)`.
-
-2. **Log-space E-step is numerically stable.** Initialize 3 components. Compute responsibilities for obs 100 std deviations from all means. Assert no NaN or inf.
-
-3. **E-step responsibilities sum to 1.** For any observation, `sum(r_k over k)` must equal 1.0. Assert with `np.testing.assert_allclose`.
-
-4. **BMR reduces component count.** Generate 100 points from 2 Gaussians with K=5 initial components. After BMR, assert `K < 5`.
-
-5. **LBM conserves mass.** Random density field. 18 LBM steps. Assert `abs(mass_after - mass_before) < 1e-5`.
-
-6. **Temporal decay converges.** 100 steps of 0.7/0.3 decay with fixed true value. Assert belief is within 0.1 of true value.
-
-7. **Weber-Fechner is monotonically decreasing.** Assert `wp(1) > wp(10) > wp(100)`.
-
-8. **Hemifield pull is asymmetric.** Left saliency 0.9, right 0.1. Assert merged fixation x is left of center.
-
-9. **RG features differ across scales.** Cosine similarity between scale 1 and scale 3 features must be below 0.99.
-
-10. **Proprioception uncertainty decreases.** Start `P = 10*I`. Apply Kalman update 20 times with consistent observation. Assert `trace(P_final) < trace(P_initial)`.
-
-11. **Forward model produces different action values.** Initialize a GMM with 2 slots (ball at x=100, paddle at x=50). Call `get_action_values(obs)`. Assert that action RIGHT (moves paddle toward ball) has strictly higher value than action LEFT (moves paddle away). If all values are equal, the forward model is not applying action effects to the paddle slot. This is the most important check: if it fails, Breakout score will be 0 regardless of everything else.
-
-12. **Cerebellar smoothing does not collapse within 1000 steps.** Initialize smooth_probs as uniform [0.25, 0.25, 0.25, 0.25]. Apply 1000 EMA steps where raw_probs alternates between [0.9, 0.1, 0, 0] and [0.1, 0.9, 0, 0]. Assert entropy of final smooth_probs is above 0.3. If it collapses to one action, the EMA or episode-reset is broken.
-
-All 12 checks must pass before Phase 1.
-
----
-
-### Phase 1: Core inference stack (build in this order)
-
-1. `temporal_decay.py` - no dependencies, pure numpy
-2. `weber_fechner.py` - no dependencies, pure numpy
-3. `proprioception.py` - Kalman update, no dependencies
-4. `log_space_gmm.py` - growing slots, E/M in log space, slot velocity, `bmr.enabled` flag exposed
-5. `active_inference.py` - FE computation, perception update, **forward model (`get_action_values`)**, action generation. The forward model is the most important function in the codebase. Implement it here and verify with Phase 0 check 11 before moving on.
-6. `bmr.py` - merge and prune on schedule, must expose `self.enabled = True` flag
-
-After each file: run the corresponding Phase 0 check on the actual implementation. Do not skip check 11.
-
----
-
-### Phase 2: Brain mechanisms
-
-7. `occipital.py` - DoG, end-stopped, V1/V2/V4, PCA
-8. `visual_streams.py` - M-path and P-path separation
-9. `saccades.py` - microsaccade jitter, 3-fixation sequence
-10. `superior_colliculus.py` - contrast and motion saliency, top-K peaks
-11. `hemifield.py` - bilateral split, per-hemifield pipeline, pull merge
-12. `brain_mechanisms.py` - PFC temperature, retina, hippocampus, ITC sharpening, homeostasis
-13. `survival_alpha.py` - urgency, alpha scaling
-14. `renormalization.py` - 3-scale extraction, FE-weighted merge
-15. `cerebellar_smoothing.py` - EMA(0.7) over action probs
-
----
-
-### Phase 3: Higher cognition
-
-16. `core_knowledge.py` - Spelke priors as GMM init and precision biases
-17. `theory_theory.py` - H=4 hypothesis set, MAP selection, perturbation, weight update
-18. `lbm_physics.py` - D2Q9, 18 steps, mass-conserving, bounce-back BCs
-19. `common_sense.py` - gap-filling from buffer, cosine sim threshold 0.5
-
----
-
-### Phase 4: Wiring
-
-20. `agent.py` - `PrimalAgent` class:
-
-```python
-class PrimalAgent:
-    def __init__(self, obs_shape: tuple, n_actions: int): ...
-    def act(self, obs: np.ndarray) -> int: ...
-    def update(self, obs, action, reward, next_obs, done) -> float: ...  # returns FE
-    def reset(self) -> None: ...
-```
-
-`act` pipeline (in order): saccades (3 fixations from SC), foveal weighting per fixation, visual_streams (M and P), RG merge, theory_theory MAP, active_inference FE + action, cerebellar smoothing, return action.
-
-`update` pipeline (in order): compute FE on next_obs, perception update on GMM, hippocampus write if FE high, homeostasis update, proprioception Kalman update, survival alpha update, BMR if step % 100 == 0, return FE.
-
----
-
-### Phase 5: Logic verification tests
-
-**The tests must test logic, not just execution.**
-
-The single most common failure here is tests that look like this:
-
-```python
-# WRONG: this is not a test, it is a crash check
-def test_fe_decreases_after_update():
-    agent = PrimalAgent((84, 84, 3), 4)
-    obs = np.random.randn(84, 84, 3)
-    fe = agent.update(obs, 0, 1.0, obs, False)
-    assert fe is not None   # passes even if fe=999999 or fe=0.0 every time
-```
-
-A test that only checks "no exception raised" or "output is not None" gives zero signal about whether the math is correct. Every test below has a specific numeric threshold that must be satisfied. If the threshold is not in the test, the test is wrong.
-
-**The required implementation for each test (copy these exactly, do not simplify):**
-
+# AGENTS.md
+
+Hey! You are the autonomous Agent assigned to build a framework named Primal by Primeval. I am your Checker. This is a massive task, so we need to approach it like a senior engineering team. You will plan thoroughly and implement efficiently. I will verify your output rigorously.
+
+The goal is to unify brain-inspired mechanics into a lightweight, high-performance architecture. We want the engineering benefits of how the brain works without the bloated, expensive biological computations. 
+
+Before writing any code, you must read this entire document, understand the constraints, and follow the exact phases laid out below. Feel free to come back to this AGENTS.md whenever you want or if you lose track of the task. Do not be arrogant, just stick to the process, listen to my feedback as your Checker, and refine as you go.
+
+## The Core Framework (Primal)
+Primal must unify the following concepts into a single, cohesive system. 
+
+1. **Active Inference**. Keep it strictly to "Change the world to match yours, or change yours to match the world". Use Free Energy, Bayesian Inference, and predictive coding for action generation. Full Variational Inference planning is too expensive and slow. We are just taking the raw, practical ideas of Active Inference.
+2. **Log Space Fusion & Exponential Conjugates**. Use this for cheap Bayesian updating and continual learning. Implement a Gaussian Mixture Model for growing components without fixing the parameters initially. Start minimal and expand, ensuring it does not forget until Bayesian Model Reduction decides to prune or merge it. 
+3. **Core Knowledge and Transfer Learning**. Implement Spelke's priors (objects, space and geometry, number, agents, and physics). 
+4. **Theory Theory**. Take the main idea of maintaining multiple beliefs or hypotheses based on current context, prediction, and selection, completely avoiding full Variational Inference.
+5. **Bayesian Model Reduction (BMR)**. Use this specifically to merge or prune components and keep the model lightweight.
+6. **Abstracted Brain Mechanisms**. Implement functional, simplified versions of the PFC, VLPFC, Retinas, Macula, Fovea, Magnocellular and Parvocellular pathways, Basal Ganglia, Amygdala, Thalamus, Homeostasis, Anterior temporal lobe, Hippocampus, Hemisphere split, and Inferior temporal cortex.
+7. **Cerebellar Smoothing**. Implement this for fluid motor output.
+8. **Weber-Fechner Law**. Implement logarithmic Approximate Number System precision scaling.
+9. **Superior Colliculus**. Abstract its orienting, saccadic eye movements, and visual attention functions.
+10. **Occipital Lobe**. Abstract its visual processing pipeline from V1 edge detection up to V4 complex shape abstractions.
+11. **Hemifield Pull Imbalance**. Map this over coordinates to simulate biological visual attention.
+12. **Precision Alpha Scaling**. Model this to simulate survival urgency.
+13. **Intuitive Physics Simulation**. Implement an 18-step lattice-boltzmann fluid advection specifically to support Spelke's physics priors.
+14. **Proprioception**. Model body awareness as a continuous Gaussian distribution.
+15. **Markovian Temporal Decay**. Apply a prior belief decay formula (0.7 old + 0.3 new).
+16. **Renormalization Group**. Use this for scaling and smoothing states.
+17. **Common Sense Reasoning**. Build a mechanism for filling in the gaps of missing information.
+18. **Slot Centric Processing**. Bind this directly to the Gaussian Mixture Model for object representation.
+19. **Open Expansion**. Brainstorm and add any other highly beneficial, lightweight sub-symbolic mechanisms you can think of.
+20. **Hierarchical Predictive Coding**. Implement top-down prediction signals and bottom-up prediction error signals. Higher cortical layers must pass context down, and lower visual layers must pass surprise up.
+
+## Core Modules: Mathematical Foundations and Professional Code
+To ensure we do not over-engineer, you must base your implementations on these typed, vectorized, and professional class structures for every major functional section.
+
+### Section A: Active Inference & Theory Theory (Points 1, 4, 12)
+* **Math**: Free Energy is approximated as the difference between Expected Energy and Entropy. $F = E_Q[ \log Q(s) - \log P(o, s) ]$. Action selection minimizes this Free Energy.
+* **Code**:
 ```python
 import numpy as np
-import pytest
-from primal.brain.active_inference import ActiveInference
-from primal.brain.log_space_gmm import LogSpaceGMM
-from primal.brain.bmr import BMR
-from primal.brain.lbm_physics import LBMPhysics
-from primal.brain.temporal_decay import TemporalDecay
-from primal.brain.hemifield import Hemifield
-from primal.brain.proprioception import Proprioception
-from primal.brain.saccades import Saccades
-from primal.brain.renormalization import Renormalization
-from primal.brain.theory_theory import TheoryTheory
-from primal.brain.weber_fechner import WeberFechner
-from primal.brain.cerebellar_smoothing import CerebellarSmoothing
-from primal.brain.survival_alpha import SurvivalAlpha
-from primal.brain.common_sense import CommonSense
-from primal.brain.log_space_gmm import LogSpaceGMM
 
+class ActiveInferenceEngine:
+    """Handles core predictive coding and Free Energy minimization."""
+    
+    def __init__(self, precision_alpha: float = 1.0):
+        self.precision_alpha = precision_alpha
 
-def test_fe_decreases_after_update():
-    gmm = LogSpaceGMM(feature_dim=8, max_components=10)
-    obs = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-    fe_before = gmm.compute_fe(obs)
-    for _ in range(5):
-        gmm.update(obs)
-    fe_after = gmm.compute_fe(obs)
-    assert fe_after < fe_before, (
-        f"FE did not decrease after 5 updates on same observation. "
-        f"Before: {fe_before:.4f}, After: {fe_after:.4f}. "
-        f"This means the perception update is not working."
-    )
+    def calculate_free_energy(self, predictions: np.ndarray, observations: np.ndarray) -> float:
+        """
+        Calculates the variational free energy in log space.
+        Surprise is scaled by the survival urgency parameter (precision_alpha).
+        """
+        predictions = np.clip(predictions, 1e-8, 1.0)
+        observations = np.clip(observations, 1e-8, 1.0)
+        
+        prediction_error = np.log(observations) - np.log(predictions)
+        surprise = np.sum(prediction_error ** 2)
+        entropy = -np.sum(predictions * np.log(predictions))
+        
+        free_energy = (surprise * self.precision_alpha) - entropy
+        return float(free_energy)
+```
 
+### Section B: Log Space Fusion, GMM & BMR (Points 2, 5, 15, 18)
+* **Math**: Bayesian updating via Log-Sum-Exp to prevent numerical underflow. $P(x) = \log \sum \exp(\log w_i + \log N(x|\mu_i, \sigma_i))$. Markovian decay applies a 0.7 temporal momentum.
+* **Code**:
+```python
+import numpy as np
+from scipy.special import logsumexp
+from typing import List
 
-def test_gmm_grows_on_novel_observation():
-    gmm = LogSpaceGMM(feature_dim=4, max_components=20, novelty_threshold=0.1)
-    obs_a = np.array([0.0, 0.0, 0.0, 0.0])
-    obs_b = np.array([100.0, 100.0, 100.0, 100.0])  # very far from obs_a
-    for _ in range(10):
-        gmm.update(obs_a)
-    n_before = gmm.n_components
-    gmm.update(obs_b)
-    n_after = gmm.n_components
-    assert n_after > n_before, (
-        f"GMM did not grow on novel observation. "
-        f"Components before: {n_before}, after: {n_after}. "
-        f"novelty_threshold may be too high or BME trigger is broken."
-    )
+class GaussianComponent:
+    """Represents a single slot in the GMM."""
+    def __init__(self, mean: np.ndarray, log_var: np.ndarray):
+        self.mean = mean
+        self.log_var = log_var
+        self.n_obs = 0   # tracks maturity; BMR must not merge slots where n_obs < 5
 
+class LogSpaceGMM:
+    """Handles Gaussian Mixture Model operations securely in log space."""
+    
+    def __init__(self, decay_rate: float = 0.7):
+        self.components: List[GaussianComponent] = []
+        self.decay_rate = decay_rate
 
-def test_bmr_reduces_components():
-    gmm = LogSpaceGMM(feature_dim=4, max_components=20)
-    # Create 5 nearly identical components by feeding the same point repeatedly
-    base = np.array([1.0, 1.0, 1.0, 1.0])
-    for i in range(5):
-        gmm.slots.append(gmm._new_slot(base + np.random.randn(4) * 0.01))
-    n_before = gmm.n_components
-    bmr = BMR(merge_threshold=2.0, prune_threshold=0.01)
-    bmr.run(gmm)
-    n_after = gmm.n_components
-    assert n_after < n_before, (
-        f"BMR did not reduce components. Before: {n_before}, after: {n_after}. "
-        f"KL divergence between nearly-identical components should be near 0, "
-        f"well below merge_threshold=2.0. Check KL formula."
-    )
+    def log_space_bayesian_update(self, log_prior: np.ndarray, log_likelihood: np.ndarray) -> np.ndarray:
+        """
+        Fuses prior and likelihood securely in log space to prevent numerical underflow.
+        """
+        unnormalized_posterior = log_prior + log_likelihood
+        evidence = logsumexp(unnormalized_posterior)
+        log_posterior = unnormalized_posterior - evidence
+        return log_posterior
 
+    def markovian_decay(self, old_belief: np.ndarray, new_belief: np.ndarray) -> np.ndarray:
+        """Applies temporal momentum to beliefs."""
+        return self.decay_rate * old_belief + (1.0 - self.decay_rate) * new_belief
 
-def test_lbm_mass_conservation():
-    lbm = LBMPhysics(height=42, width=42)
-    density = np.random.rand(42, 42) + 0.1
-    lbm.set_density(density)
-    mass_before = lbm.total_mass()
-    for _ in range(18):
-        lbm.step()
-    mass_after = lbm.total_mass()
-    assert abs(mass_after - mass_before) < 1e-4, (
-        f"LBM does not conserve mass. Before: {mass_before:.6f}, after: {mass_after:.6f}. "
-        f"Difference: {abs(mass_after - mass_before):.2e}. "
-        f"Check streaming step (np.roll) and BGK collision. "
-        f"Python loops over grid cells will also cause this."
-    )
+    def m_step_update(self, component: GaussianComponent, new_obs: np.ndarray) -> None:
+        """
+        Updates a component mean with Markovian decay and increments its observation
+        counter. n_obs is required for BMR maturity gating. Without incrementing it,
+        n_obs stays 0 forever, BMR skips every slot, and the model never prunes.
+        """
+        component.mean = self.markovian_decay(component.mean, new_obs)
+        component.n_obs += 1
+```
 
+### Section C: Visual Mechanics & Saliency (Points 6, 8, 9, 10, 11)
+* **Math**: Weber-Fechner scaling for numerical perception $P = k \log(S)$. Hemifield pull calculates an attention vector based on foveal center offsets.
+* **Code**:
+```python
+import numpy as np
 
-def test_temporal_decay_converges():
-    decay = TemporalDecay(alpha=0.3)  # 0.7 old + 0.3 new
-    belief = 0.0
-    true_value = 5.0
-    for _ in range(200):
-        belief = decay.update(belief, true_value)
-    assert abs(belief - true_value) < 0.5, (
-        f"Temporal decay did not converge to true value after 200 steps. "
-        f"Belief: {belief:.4f}, true: {true_value}. "
-        f"Expected convergence within 0.5. Check 0.7/0.3 formula direction."
-    )
+class VisualSystem:
+    """Abstracts retinal foveation and numerical perception scaling."""
+    
+    def __init__(self, weber_k: float = 1.0):
+        self.weber_k = weber_k
 
+    def apply_foveal_mask(self, image: np.ndarray, focal_y: int, focal_x: int, radius: float) -> np.ndarray:
+        """
+        Simulates foveal vision with high resolution at the focal point, 
+        degrading to low resolution in the periphery (Magnocellular pathway).
+        """
+        y_coords, x_coords = np.ogrid[:image.shape[0], :image.shape[1]]
+        squared_dist = (x_coords - focal_x)**2 + (y_coords - focal_y)**2
+        distance = np.sqrt(squared_dist)
+        
+        mask = np.clip(1.0 - (distance / radius), 0.1, 1.0)
+        return image * mask
 
-def test_hemifield_pull_asymmetry():
-    hf = Hemifield(width=84, height=84)
-    # Strong saliency on left, none on right
-    saliency = np.zeros((84, 84))
-    saliency[:, :20] = 1.0   # left side only
-    fixation_x = hf.compute_fixation_x(saliency)
-    assert fixation_x < 42, (
-        f"Hemifield pull should be left of center when left saliency dominates. "
-        f"Got fixation_x={fixation_x:.1f}, center=42. "
-        f"Check pull weighting formula."
-    )
+    def weber_fechner_scaling(self, stimulus_intensity: np.ndarray) -> np.ndarray:
+        """Scales numerical perception logarithmically."""
+        return self.weber_k * np.log(stimulus_intensity + 1.0)
+```
 
+### Section D: Intuitive Physics & Core Knowledge (Points 3, 7, 13, 14, 16)
+* **Math**: Lattice-Boltzmann method for fluid/physics advection. $f_i(x+c_i \Delta t, t+\Delta t) = f_i(x,t) - \frac{1}{\tau}(f_i(x,t) - f_i^{eq}(x,t))$.
+* **Code**:
+```python
+import numpy as np
 
-def test_proprioception_uncertainty_decreases():
-    prop = Proprioception(state_dim=4)
-    trace_before = np.trace(prop.P)
-    obs = np.array([10.0, 10.0, 1.0, 0.5])
-    for _ in range(20):
-        prop.predict()
-        prop.update(obs)
-    trace_after = np.trace(prop.P)
-    assert trace_after < trace_before, (
-        f"Proprioception uncertainty did not decrease after 20 consistent observations. "
-        f"trace(P) before: {trace_before:.4f}, after: {trace_after:.4f}. "
-        f"Check Kalman gain K and update step (I - K@H)@P_prior."
-    )
+class IntuitivePhysicsEngine:
+    """Implements fluid advection for Spelke physics priors."""
+    
+    def __init__(self, tau: float = 0.6):
+        self.tau = tau
+        # D2Q9 lattice velocities (cy, cx)
+        self.velocities = np.array([
+            [0, 0], [0, 1], [1, 0], [0, -1], [-1, 0],
+            [1, 1], [-1, 1], [-1, -1], [1, -1]
+        ])
 
+    def lattice_boltzmann_step(self, grid: np.ndarray) -> np.ndarray:
+        """
+        Executes a vectorized D2Q9 streaming and collision step.
 
-def test_saccades_produce_distinct_fixations():
-    sac = Saccades(frame_height=84, frame_width=84)
-    saliency = np.random.rand(84, 84)
-    fixations = sac.generate_fixations(saliency, n=3)
-    assert len(fixations) == 3, f"Expected 3 fixations, got {len(fixations)}"
-    # All 3 must not be the same point
-    coords = [(f[0], f[1]) for f in fixations]
-    assert len(set(coords)) > 1, (
-        f"All 3 fixations are identical: {coords}. "
-        f"Saccade generator is not producing distinct fixation points. "
-        f"Check peak selection and minimum-distance constraint."
-    )
-    # Each fixation must be within frame bounds
-    for fx, fy in coords:
-        assert 0 <= fx < 84 and 0 <= fy < 84, f"Fixation ({fx},{fy}) out of bounds"
+        The outer loop runs exactly 9 times (one per lattice direction). This is
+        O(9) and perfectly acceptable. The forbidden pattern is an inner loop over
+        grid cells: for x in range(W): for y in range(H). That is O(W*H) Python
+        iterations and will destroy performance. Every operation inside this loop
+        must act on the full grid array at once via np.roll and numpy arithmetic.
+        """
+        next_grid = np.zeros_like(grid)
+        grid_mean = grid.mean(axis=0)
+        
+        for i, (cy, cx) in enumerate(self.velocities):
+            rolled = np.roll(grid[i], shift=(cy, cx), axis=(0, 1))
+            next_grid[i] = rolled - (rolled - grid_mean) / self.tau
+            
+        return next_grid
+```
 
+## Failure Modes to Avoid
+Before building the architecture, you must design against these specific failure modes.
 
-def test_rg_features_are_scale_distinct():
-    rg = Renormalization(scales=[1.0, 0.5, 0.25])
-    frame = np.random.rand(84, 84).astype(np.float32)
-    features = rg.extract_all_scales(frame)   # returns list of 3 feature vectors
-    assert len(features) == 3
-    cos_sim_01 = np.dot(features[0], features[1]) / (
-        np.linalg.norm(features[0]) * np.linalg.norm(features[1]) + 1e-8)
-    cos_sim_02 = np.dot(features[0], features[2]) / (
-        np.linalg.norm(features[0]) * np.linalg.norm(features[2]) + 1e-8)
-    assert cos_sim_01 < 0.99, (
-        f"Scale 1 and scale 2 features are nearly identical (cosine={cos_sim_01:.4f}). "
-        f"Downsampling is not producing distinct features. Check resize logic."
-    )
-    assert cos_sim_02 < 0.99, (
-        f"Scale 1 and scale 3 features are nearly identical (cosine={cos_sim_02:.4f}). "
-        f"Downsampling is not producing distinct features."
-    )
+1. **Gaussian Component Explosion**: The GMM will try to spawn a new component for every slight variation. You must implement aggressive Bayesian Model Reduction (BMR) to prune overlapping distributions based on Kullback-Leibler divergence.
+2. **Variational Inference Bloat**: Do not write full VI graphical unrolling. It will destroy CPU performance. Use greedy, local predictive coding for step-by-step Free Energy minimization.
+3. **Log Space Underflow**: When fusing distributions, raw probabilities will multiply to zero. Everything must be passed through `scipy.special.logsumexp`.
+4. **Saccadic Thrashing**: The Superior Colliculus logic might get stuck rapidly bouncing between two equally salient visual points. Implement Inhibition of Return (IOR) to force the attention gate to explore new visual coordinates.
+5. **Action Signal Collapse**: `get_action_values()` must return values that differ by more than 0.5 across actions. If you compute FE in the raw feature space (thousands of dims), moving the paddle 3 pixels changes almost nothing and every action gets the same score, meaning the agent becomes random. Compute action values in slot-position space instead: find the ball slot (highest velocity magnitude), predict its next x position, score each action by negative squared distance between predicted ball x and predicted paddle x. Signal must be measurable. Add this assertion to your verify step:
+   ```python
+   signal = max(action_values) - min(action_values)
+   assert signal > 5.0, f"Action signal {signal:.4f} too weak, agent will be random"
+   ```
+6. **Symbolic Cheating**: Never read game RAM (`env.unwrapped.ale.getRAM()`), never hardcode pixel regions, never write `if env_name == "breakout"`. The agent must infer all world state from GMM slots alone. Ball = slot with highest velocity magnitude. Paddle = proprioception Kalman state. Run `grep -r "getRAM\|ram\[" primal/` before the Breakout test to ensure it returns empty.
+7. **Smoke Run Passed as Episode**: 150 steps is not an episode. Run Breakout until `terminated or truncated`. No `max_steps` below 10,000.
+8. **BMR Destroying Immature Prototypes**: BMR merges slots whose Gaussians overlap significantly. After seeing only 1 to 3 samples, every slot has huge covariance because the distribution is wide due to uncertainty, not because it is similar to another class. Wide Gaussians look similar to BMR even if their means are far apart, so BMR merges digit prototypes and accuracy collapses to roughly 10%. The correct fix is slot maturity gating: every slot tracks `n_obs` (number of observations absorbed). BMR must skip any slot where `n_obs < min_obs` (suggested: 5). Once a slot has seen enough observations, its covariance tightens around the true mean, and genuinely different prototypes will no longer overlap, so BMR will leave them alone naturally. Do NOT disable BMR globally. That breaks the sub-symbolic purity of the system. Instead fix BMR to be maturity-aware:
+   ```python
+   def should_merge(slot_a: GaussianComponent, slot_b: GaussianComponent, threshold: float) -> bool:
+       if slot_a.n_obs < 5 or slot_b.n_obs < 5:
+           return False   # never merge immature slots
+       kl = kl_divergence(slot_a, slot_b)
+       return kl < threshold
+   ```
+   The GMM must also call `m_step_update()` on every observation so that `n_obs` actually increments. If `n_obs` is never incremented, it stays 0 forever, the maturity guard fires on every slot unconditionally, and BMR silently stops pruning anything. This means MNIST slot count is discovered automatically. The agent opens a slot whenever a novel digit triggers high FE, and BMR only prunes it if it genuinely converges with another after sufficient observations.
+9. **Shortcut Features Breaking Sub-Symbolic Purity**: Using HOG, Euler number, or skeletonize for MNIST is symbolic, as these are handcrafted descriptors that encode human knowledge about digit structure. A truly sub-symbolic agent does not know it is looking at a digit any more than it knows it is playing Breakout. It simply receives an observation and runs it through its visual pipeline. The occipital module already does this: DoG on/off channels detect edges, end-stopped cells fire at stroke endpoints and corners, 24 Gabor filters capture oriented edges at multiple scales, V2 captures curvature, V4 responds to closed loops and complex shapes. End-stopped cells naturally encode what Euler number encodes manually. V4 cells naturally encode what skeletonize encodes manually. The 94.79% ceiling happened because HOG was used as a shortcut instead of trusting the visual pipeline. The fix is to feed every observation (whether it is a game frame or a digit image) through the same visual pathway without modification. The architecture must never branch on what type of input it is receiving.
+10. **Hippocampus Replay Direction**: If the hippocampus replays miss events by calling `gmm.update(miss_features)`, it teaches the model that miss states are normal, lowers FE on misses, and score drops episode over episode. Replay must only update action values. Call `update_action_value(bad_action, delta=-abs(fe))`. Never call `gmm.update()` inside replay.
 
+## Strict Constraints
+* **Zero Tolerance for Laziness or Stubs**. You must write complete, production-ready code. Do not use `pass`, `NotImplementedError`, or placeholders like `# TODO: implement this logic later`. Every function must contain the actual, working mathematical and logical implementation. I am your Checker, not your assistant. I will not finish your code for you.
+* **Universal Generalization (100% Sub-symbolic)**. The framework must be entirely universal. By remaining completely sub-symbolic, it will naturally solve any environment without modification. No hardcoded domain knowledge, no hardcoded policies, no hand-tuned heuristics, and no hints. The architecture must be completely blind about the world at initialization. It must never know if it is playing Breakout or classifying MNIST digits.
+* **No Seed Hunting**. You are strictly forbidden from using fixed or tuned seeds to achieve the benchmark. The framework must be mathematically robust. Do not pass a seed to `env.reset()` or any random number generator. If the framework only works with a specific seed, the logic is brittle and you must fix the math, not the seed.
+* **No Pre-trained Weights**. You cannot download or load any pre-trained models, weights, or heuristic filters. Everything must be generated mathematically at runtime.
+* **Numerical Stability and NaN Prevention**. Bayesian updating and log space math are highly prone to NaN values or infinite values if handled poorly. You must use rigorous clipping and `logsumexp`. Add strict assertions checking for NaNs after every major math block to instantly catch numerical collapses before they infect the Gaussian Mixture Model.
+   ```python
+   assert not np.isnan(computed_array).any(), "Fatal: NaN value detected in math block."
+   ```
+* **Lightweight**. As long as you implement the items above strictly for their engineering benefits, it will be fast. Use Python, numpy, and scipy. Avoid massive deep learning libraries unless absolutely necessary.
+* **Do Not Over-engineer**. Do not overthink it, do not oversimplify it, and do not write bloated math. Keep the logic sharp and functional.
 
-def test_theory_theory_map_improves_over_time():
-    tt = TheoryTheory(n_hypotheses=4, feature_dim=8)
-    # True observation is near [1, 0, 0, 0, 0, 0, 0, 0]
-    true_obs = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    # Seed one hypothesis near the true observation
-    tt.hypotheses[0].mean = true_obs + np.random.randn(8) * 0.1
-    fe_early = tt.map_hypothesis().predict_fe(true_obs)
-    for _ in range(50):
-        tt.update(true_obs)
-    fe_late = tt.map_hypothesis().predict_fe(true_obs)
-    assert fe_late < fe_early, (
-        f"MAP hypothesis FE did not improve over 50 updates. "
-        f"Early FE: {fe_early:.4f}, late FE: {fe_late:.4f}. "
-        f"Bayesian weight update or hypothesis selection is broken."
-    )
+## Execution Phases
 
+### Phase 1: The Plan (Deep Think & Architecture)
+Before writing any actual framework code, you must brainstorm and write out a concrete architectural plan.
+* Map out how all 20+ components connect.
+* Define the data structures. Everything needs to flow logically.
+* Verify your math mentally based on the core module examples provided above.
+* **Create a TODO.md**: You must explicitly create a `TODO.md` file to track progress. Keep it updated as you move through the phases. Only proceed to coding once you are absolutely certain the theory holds up and fits together smoothly. Submit your plan to me (your Checker) before proceeding.
 
-def test_weber_fechner_monotone():
-    wf = WeberFechner(alpha=1.0)
-    p1 = wf.precision(1.0)
-    p10 = wf.precision(10.0)
-    p100 = wf.precision(100.0)
-    assert p1 > p10 > p100, (
-        f"Weber-Fechner precision is not monotonically decreasing. "
-        f"precision(1)={p1:.4f}, precision(10)={p10:.4f}, precision(100)={p100:.4f}. "
-        f"Expected p1 > p10 > p100. Check formula: alpha / (log1p(|x|) + eps)."
-    )
+### The TODO.md Format Requirement
+Here is the exact format you must use for your `TODO.md` file. You will update the checkboxes as you complete each task.
 
+```markdown
+# TODO: Primal Framework Execution Tracker
 
-def test_cerebellar_smoothing_does_not_collapse():
-    cs = CerebellarSmoothing(n_actions=4, alpha=0.3)
-    # Alternate between two different action distributions
-    for i in range(500):
-        if i % 2 == 0:
-            raw = np.array([0.7, 0.1, 0.1, 0.1])
-        else:
-            raw = np.array([0.1, 0.7, 0.1, 0.1])
-        cs.smooth(raw)
-    final_probs = cs.smooth_probs
-    entropy = -np.sum(final_probs * np.log(final_probs + 1e-8))
-    assert entropy > 0.5, (
-        f"Cerebellar smoothing collapsed after 500 alternating steps. "
-        f"Final probs: {final_probs}, entropy: {entropy:.4f}. "
-        f"Expected entropy > 0.5 when input alternates between two distributions. "
-        f"EMA alpha may be too high, or smooth_probs not being updated correctly."
-    )
+## Phase 1: Planning
+- [x] Brainstorm architecture and module connections.
+- [x] Define data structures and mentally verify math.
+- [x] Create this TODO.md file.
 
+## Phase 2: MVP & Critical Thinking
+- [ ] Implement Active Inference Free Energy calculator.
+- [ ] Implement Log Space GMM with NaN protection and n_obs tracking.
+- [ ] Implement basic visual routing and Hierarchical Predictive Coding.
+- [ ] Implement Hippocampal Episodic Buffer for one-shot anchoring.
+- [ ] Verify action signal > 5.0 (slot-position forward model, not feature-space FE).
+- [ ] Run MVP Benchmark (Breakout >5 score, MNIST >70%).
+- [ ] Output terminal logs to the conversation for debugging.
 
-def test_survival_alpha_increases_on_negative_reward():
-    sa = SurvivalAlpha(alpha_min=0.5, alpha_max=3.0)
-    # Feed positive rewards: alpha should stay low
-    for _ in range(20):
-        sa.update(reward=1.0)
-    alpha_good = sa.alpha
-    # Feed negative rewards: alpha should rise
-    for _ in range(20):
-        sa.update(reward=-1.0)
-    alpha_bad = sa.alpha
-    assert alpha_bad > alpha_good, (
-        f"Survival alpha did not increase on negative rewards. "
-        f"Alpha after positive rewards: {alpha_good:.4f}, "
-        f"after negative rewards: {alpha_bad:.4f}. "
-        f"Check urgency formula and reward_running_mean update."
-    )
+## Phase 3: Full Implementation
+- [ ] Create `brain/` directory structure.
+- [ ] Write `agent.py` API wrapper.
+- [ ] Write Primeval `LICENSE`.
+- [ ] Write `pyproject.toml`.
+- [ ] Implement all remaining cortex and physics mechanisms.
 
+## Phase 4: Full Verification
+- [ ] grep -r "getRAM\|ram\[" primal/ returns empty.
+- [ ] Run 1-shot MNIST test (10k evaluation) targeting >90% using occipital pipeline features (no handcrafted descriptors).
+- [ ] Confirm digit 7 and digit 9 are not confused by checking per-class accuracy and tuning V4 if needed.
+- [ ] Run Breakout/Pong physics test with no fixed seed, targeting mastery in <2 episodes.
+- [ ] Capture all terminal output, analyze, and debug failures.
+- [ ] Profile iterations per second (target >10) and RAM usage (target <2GB).
 
-def test_common_sense_retrieves_similar_state():
-    cs = CommonSense(buffer_size=100, feature_dim=8)
-    # Store a known state
-    known_features = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    known_action = 2
-    cs.store(known_features, known_action, fe=5.0)
-    # Query with a very similar state
-    query = known_features + np.random.randn(8) * 0.01
-    retrieved_action, sim = cs.retrieve(query)
-    assert sim > 0.95, (
-        f"Common sense retrieval similarity too low: {sim:.4f}. "
-        f"Expected > 0.95 for nearly identical feature vectors. "
-        f"Check cosine similarity computation."
-    )
-    assert retrieved_action == known_action, (
-        f"Common sense retrieved wrong action: {retrieved_action}, expected {known_action}."
-    )
+## Phase 5: Finalization
+- [ ] Write detailed `README.md`.
 
+## Stuck
+<!-- Only fill this in if you have made 3 genuine attempts at a specific problem and are still failing. -->
+<!-- Describe what is failing, what you have already tried, and paste the exact terminal output. -->
+<!-- The Checker will read this and send a targeted fix. Do not keep guessing past 3 attempts. -->
+```
 
-def test_lateral_inhibition_sharpens_responsibilities():
-    gmm = LogSpaceGMM(feature_dim=4, max_components=5)
-    # Force 3 components with similar means
-    for i in range(3):
-        slot = gmm._new_slot(np.array([float(i), 0.0, 0.0, 0.0]))
-        gmm.slots.append(slot)
-    obs = np.array([0.5, 0.0, 0.0, 0.0])  # between component 0 and 1
-    resp_before = gmm.e_step(obs)
-    entropy_before = -np.sum(resp_before * np.log(resp_before + 1e-8))
-    gmm.apply_lateral_inhibition(obs)
-    resp_after = gmm.e_step(obs)
-    entropy_after = -np.sum(resp_after * np.log(resp_after + 1e-8))
-    assert entropy_after < entropy_before, (
-        f"Lateral inhibition did not sharpen responsibilities. "
-        f"Entropy before: {entropy_before:.4f}, after: {entropy_after:.4f}. "
-        f"Expected entropy to decrease (sharper winner-take-all). "
-        f"Check ITC contrast sharpening formula."
+### Phase 2: MVP & Critical Thinking (Build Small, Verify Early)
+Before building the entire 20-component monolith, you must exercise critical thinking by building a Minimum Viable Product.
+* Identify and build the smallest functional core. This means implementing only the Active Inference engine, the Log Space GMM, basic visual routing, and a **Hippocampal Episodic Buffer**.
+* The Hippocampal Episodic Buffer is the absolute smallest brain component required for one-shot learning. It acts as an instant associative memory cache. When a novel observation triggers a massive prediction error, the Hippocampus instantly anchors that topological snapshot into a new GMM slot with maximum precision. This avoids the slow gradient-based learning problem and allows immediate recall for the next frame. The Hippocampus also relies on Theory Theory: when a high-FE event is stored, it is tagged with the currently active hypothesis from the Theory Theory module. During replay, the agent does not just punish the bad action. It also updates the hypothesis weights, demoting the hypothesis that predicted the missed outcome and promoting any hypothesis that would have predicted it correctly. This means episodic memory and belief revision happen together, which is how biological recall actually works.
+* Verify this small core thoroughly before adding the rest of the cortex and physics mechanics.
+* **MVP Benchmark**: This simplified version must prove the foundational math actually works. It absolutely must achieve a score of >5 on Breakout and a >70% accuracy on the one-shot MNIST task relying purely on the Hippocampal buffer.
+* **Terminal Debugging Loop**: You must run the code, capture the exact terminal output, and print it into our conversation so I can check it. If it fails the MVP benchmark, you will read your own terminal traces, critically analyze the math, debug the core logic, and refine it until it passes.
+
+### Phase 3: Full Implementation (The Complete Code)
+Once the MVP proves the foundation is rock solid, build out the rest of the architecture.
+1. Create a `brain/` directory to house all modular concepts cleanly.
+2. Create an `agent.py` file in the root directory that imports from `brain/` and exposes a single, clean API.
+3. Write a custom license file `LICENSE` for our company, Primeval.
+4. Write a fully configured `pyproject.toml` to manage dependencies.
+5. Create an `__init__.py` setup to make it a proper package.
+6. Update the `TODO.md` file.
+
+### Phase 4: Full Verification (The Verifial Loop)
+This is the most important step. You must verify that your fully assembled logic and code work flawlessly.
+
+* **Image Test (MNIST)**: Test the framework on MNIST. It must learn using exactly 3 samples per class (30 training samples total, first/middle/last occurrence of each digit). Features must come from the occipital pipeline without HOG or any handcrafted descriptors. After this rapid few-shot learning phase, it absolutely must run inference on all 10,000 test samples and achieve **>90% accuracy**. Track per-digit accuracy, noting that digit 7 and digit 9 are the hardest pairs (confused by pure edge features). If overall accuracy plateaus below 90% and 7/9 confusion is high, the occipital V4 closed-loop response is not strong enough. Tune V4 sensitivity before adding any handcrafted features.
+* **Why this is possible**: Standard neural networks fail at one-shot learning because they blindly map flat pixel arrays to arbitrary weight vectors, requiring thousands of examples to learn translation invariance. Primal behaves like a biological visual system. By using foveation and saccadic movements via the Superior Colliculus, it traces the actual edges of a digit (Occipital V1 processing). It builds a relational, topological graph of strokes, loops, and intersections using Spelke's geometry priors. Because a digit "8" is fundamentally just two stacked topological loops, matching this geometric graph requires only one visual example anchored by the Hippocampus. The Log Space Fusion and GMM allow the model to dynamically stretch and fit this topology over the test set without forgetting the core structural rules.
+* **Data Fallback Mechanism**: Network requests fail. If fetching MNIST from OpenML throws an error, you must include a fallback function. This fallback should use standard `urllib` to directly download the raw gzip files from a stable mirror. You must then decompress them and parse the byte structures manually into numpy arrays. Do not let a simple network error stop the verification loop.
+
+```python
+import urllib.request
+import gzip
+import os
+import numpy as np
+from typing import Tuple
+
+def load_mnist_fallback(path: str = "/tmp/mnist") -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    os.makedirs(path, exist_ok=True)
+    base_url = "https://storage.googleapis.com/cvdf-datasets/mnist/"
+    
+    def download_file(name: str) -> str:
+        filepath = os.path.join(path, name)
+        if not os.path.exists(filepath):
+            urllib.request.urlretrieve(base_url + name, filepath)
+        return filepath
+        
+    def read_images(filepath: str) -> np.ndarray:
+        with gzip.open(filepath) as file_buffer:
+            file_buffer.read(16)
+            buffer = file_buffer.read()
+            return np.frombuffer(buffer, np.uint8).reshape(-1, 784) / 255.0
+            
+    def read_labels(filepath: str) -> np.ndarray:
+        with gzip.open(filepath) as file_buffer:
+            file_buffer.read(8)
+            buffer = file_buffer.read()
+            return np.frombuffer(buffer, np.uint8)
+            
+    return (
+        read_images(download_file("train-images-idx3-ubyte.gz")),
+        read_labels(download_file("train-labels-idx1-ubyte.gz")),
+        read_images(download_file("t10k-images-idx3-ubyte.gz")),
+        read_labels(download_file("t10k-labels-idx1-ubyte.gz"))
     )
 ```
 
-**Every test has:**
-1. A specific numeric threshold (`< 0.5`, `> 0.95`, `< 0.99`, etc.)
-2. A failure message that explains what the threshold means and what is likely wrong
-3. Synthetic data that controls the expected outcome (not random game frames)
-4. An assertion that would fail if the implementation returns a constant, a zero, or a placeholder
-
-**A test that passes by doing nothing is not a test.** If you can make a test pass by returning `0.0` from the function under test, the test is wrong. Every test above would fail if the function returned a constant.
-
-All 15 must pass before Phase 6. If any fail, read the failure message. It tells you which formula is wrong.
-
----
-
-### Phase 6: Breakout/Pong test
+* **Physics Test**: Test it on a heavy physics Gymnasium ALE environment like Breakout or Pong. Note that you must install dependencies strictly using `pip install gymnasium[atari] ale-py`. Gymnasium versions >= 1.0 and ale-py >= 0.9 come with ROMs natively bundled. You do not need to install AutoROM and you do not need to accept any ROM licenses. It works completely out of the box.
 
 ```python
 import gymnasium as gym
 import ale_py
 
-gym.register_envs(ale_py)  # REQUIRED, without this Atari envs do not exist
+# Required for Gymnasium >= 1.0; without this line, Atari envs do not exist
+gym.register_envs(ale_py)
+
 env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
+obs, _ = env.reset()   # no seed
+# Run loop and benchmark
 ```
 
-**Speed gate (run this before anything else in Phase 6):**
-
-Before running full episodes, verify the agent can actually run at speed. Run 200 steps and measure it/s:
-
-```python
-import time, psutil, os
-obs, _ = env.reset()
-t0 = time.perf_counter()
-for _ in range(200):
-    action = agent.act(obs)
-    obs, reward, term, trunc, _ = env.step(action)
-    if term or trunc:
-        obs, _ = env.reset()
-elapsed = time.perf_counter() - t0
-its = 200 / elapsed
-print(f"Speed check: {its:.2f} it/s")
-assert its >= 10.0, f"FAIL: {its:.2f} it/s is below 10. Optimize before running full episodes."
-```
-
-If it/s is below 10, stop. Do not run full episodes at 2 it/s: it wastes time and produces garbage results because the agent cannot react fast enough. Profile with `cProfile` and fix the bottleneck first. The two known bottlenecks are:
-
-**LBM:** Must be fully vectorized over the entire spatial grid in one numpy operation per step. No Python loops over grid cells. `np.roll` for streaming, array-wise BGK for collision. If you have any `for x in range(width): for y in range(height):` inside the LBM step, that is the bottleneck.
-
-**Gabor convolution:** Must use `scipy.ndimage.convolve` or `cv2.filter2D` applied to the full image at once. Precompute all 24 kernels at init time. Apply them in a batch using `np.stack` and `scipy.ndimage.convolve`. No per-pixel loops.
-
-**Full episode run (no step limits, no smoke runs):**
-
-A smoke run of 150 steps is not a Breakout test. 150 steps is roughly 2 seconds of gameplay and covers less than one life. The agent never gets enough frames to learn anything meaningful.
-
-Run at least 2 complete episodes where each episode ends only when the game says it is over (all lives exhausted or episode done flag). Do not impose `max_steps` unless it is above 10,000. Print results after each full episode.
-
-```python
-for ep in range(1, 3):
-    obs, _ = env.reset()
-    ep_score = 0
-    ep_steps = 0
-    aligned = 0
-    done = False
-    agent.reset()
-    while not done:
-        action = agent.act(obs)
-        # compute paddle alignment before stepping
-        # (requires extracting ball_x and paddle_x from slot means)
-        next_obs, reward, term, trunc, info = env.step(action)
-        agent.update(obs, action, reward, next_obs, term or trunc)
-        ep_score += reward
-        ep_steps += 1
-        obs = next_obs
-        done = term or trunc
-    print(f"ep={ep} score={ep_score} steps={ep_steps} alignment={aligned/ep_steps:.3f}")
-```
-
-Track per step: episode, score, lives, FE value, it/s (rolling 100-step window), RAM via psutil.
-
-Track per episode: total score, episode length, mean FE, FE trend, action distribution entropy, paddle_alignment.
-
-Target by end of episode 2: mastery, not lucky contact. All criteria are defined in the "Breakout mastery criteria" section of the Definition of Done. They must all print as PASS.
-
-The minimum bar is:
-- ep2 score >= 30
-- ep2 paddle_alignment >= 0.60 (agent actively tracks the ball)
-- ep2 entropy in [0.05, 0.80]
-- ep2 score strictly greater than ep1 score
-- it/s >= 10 (measured during episode, not just warmup)
-
-Score=0.0 for both episodes is a hard failure. Score of 1-5 with no improvement is a hard failure. Entropy=0.000 is a hard failure. FE decreasing while score stays at 0 means perception is learning but action is broken. Do not move on.
-
-**Specific debug for paddle_alignment = 0.000:**
-
-If paddle never moves toward the ball, print the following every 50 steps during the episode:
-
-```python
-ball_slot  = agent.get_slot_by_flag("agent")   # highest residual velocity slot
-paddle_slot = agent.get_slot_by_flag("self")    # proprioception center
-ball_x   = ball_slot.mu[0] if ball_slot else None
-paddle_x = paddle_slot.mu[0] if paddle_slot else None
-action_values = agent.get_action_values()       # FE reduction per action
-print(f"  ball_x={ball_x:.1f} paddle_x={paddle_x:.1f} action_values={action_values}")
-```
-
-If `ball_x` is None, the ball is not being tracked as a slot. Spelke object continuity threshold is too loose, or M-path is not feeding position into slots.
-
-If `action_values` are all equal, the generative model does not distinguish action consequences. The action head is returning a constant. Check that action is included in the state prediction and that different actions actually produce different predicted next states.
-
-If `action_values` differ but the agent still picks the same action every time, check that temperature is not near zero. Print `agent.temperature` every step.
-
-**Specific debug for entropy = 0.012 (near-zero but not exactly zero):**
-
-Entropy of 0.012 means the agent is picking one action about 99% of the time with tiny probability on others. This is not "slightly exploratory," it is collapsed. The cerebellar EMA is locking onto one action. Check:
-
-1. Is `prev_smooth_probs` being reset at episode start? If not, it carries the previous episode's collapsed distribution.
-2. Is the EMA alpha too aggressive? `0.7 * stale_probs + 0.3 * new_probs` where stale_probs is already [1, 0, 0, 0] will converge back to [1, 0, 0, 0] regardless of new_probs within a few steps.
-3. Print the raw (pre-smoothing) action_probs. If those are already collapsed, the problem is upstream in action generation, not in the smoother.
-
-**Debug order if not improving:**
-
-1. FE trajectory. If flat or rising, perception update is broken. Check E-step sign: does moving mu toward observation decrease FE? It must.
-
-2. Action generation. If FE decreases but actions are random, check that action value estimates actually vary by action. If they are all equal, the generative model is not predicting action consequences.
-
-3. Cerebellar smoothing. If EMA alpha is too close to 1.0, the signal washes out. Try 0.7/0.3.
-
-4. Hippocampus replay. Are high-FE events actually being replayed? Add a print to confirm.
-
-5. Performance. If below 10 it/s, profile with `cProfile`. LBM and Gabor convolutions are the likely bottlenecks. Both can be fully vectorized over the spatial grid.
-
----
-
-### Phase 7: MNIST test
-
-Load via `sklearn.datasets.fetch_openml("mnist_784", version=1)`.
-
-**Critical: disable BMR during the learning phase.**
-
-The single most common MNIST failure is that BMR merges digit prototypes together during the 10-sample learning phase. If you show the agent "0" and "6" and they have similar visual features, BMR will merge their slots before you finish the learning phase. You end up with 2 slots instead of 10, and accuracy drops to 10% (random guessing).
-
-The fix is a one-line flag: `agent.bmr.enabled = False` before learning, `agent.bmr.enabled = True` after. The BMR module must expose this flag.
-
-```python
-# MNIST learning phase
-agent.reset()
-agent.bmr.enabled = False          # CRITICAL: disable BMR during learning
-agent.gmm.novelty_threshold = 0.0  # CRITICAL: always open new slot for each new sample
-
-slot_to_class = {}
-for label in range(10):
-    sample = train_X[train_y == label][0].reshape(28, 28)
-    agent.update(obs=sample, action=0, reward=1.0, next_obs=sample, done=False)
-    # find which slot just opened (highest responsibility for this sample)
-    resp = agent.gmm.e_step(agent.extract_features(sample))
-    winning_slot = int(np.argmax(resp))
-    slot_to_class[winning_slot] = label
-
-agent.bmr.enabled = True           # re-enable BMR for classification phase
-print(f"Slots after learning: {agent.gmm.n_components} (need exactly 10)")
-assert agent.gmm.n_components >= 10, "FAIL: BMR destroyed prototypes during learning"
-```
-
-If the slot count after learning is less than 10, do not proceed to classification. Debug this first.
-
-**Learning (10 samples):** Show 1 sample per class in order 0-9. After each update, record the mapping `slot_index -> class_label` by noting which slot has highest responsibility for that sample. Store in `slot_to_class = {slot_idx: label}`.
-
-**One-shot handling for unseen classes at test time:** If a test sample's winning slot is not in `slot_to_class` (because BMR opened a new slot during classification, or a class was never in training), open a new slot on the spot, assign provisional label `"unknown_N"`, count as incorrect, but do not crash.
-
-For the accuracy calculation: unknown predictions count as incorrect. Track them separately so you can see how many occurred.
-
-**Classification (10,000 samples):** For each test sample, call `agent.act(obs=image)`. Get winning slot. Look up `slot_to_class`. If missing, apply one-shot handler. Track accuracy over all 10,000 samples.
-
-Target: above 90%.
-
-**Debug order if below 90%:**
-
-1. **Slot count.** If fewer than 10 slots after learning, BMR is the problem. Verify `agent.bmr.enabled = False` was set, and verify `agent.gmm.novelty_threshold = 0.0` forces new slot creation. If novelty_threshold is not 0, the GMM may assign a new sample to an existing slot instead of opening a new one.
-
-2. **Feature distinctiveness.** After the learning phase, print the pairwise cosine similarity between all 10 slot means. If any two slots have cosine similarity above 0.98, their feature vectors are nearly identical. This means the visual pipeline is not distinguishing those two digit classes. Check V4 feature dimensionality: is PCA reducing to enough dimensions? Try increasing to 128 or 192.
-
-3. **Saccades.** Print fixation coordinates for 5 test samples from different classes. They must differ between images. If all images get the same fixation at (14, 14), the SC saliency map is returning uniform output. Check DoG is not returning all-zeros.
-
-4. **DoG.** On a MNIST image: a blank corner must give near-zero response. A stroke edge must give a clearly positive response. If DoG is all-zeros or all-identical, Gabor receives nothing useful and all features collapse.
-
-5. **End-stopped cells.** On a digit "1" image: the tip of the stroke should have high end-stopped response. The middle of the stroke should have near-zero end-stopped response. If end-stopped response is uniform, the subtraction of the long-Gabor from the short-Gabor is wrong (signs may be inverted).
-
-6. **PCA variance.** Print `pca.explained_variance_ratio_.sum()`. If below 0.90, increase n_components from 96 to 192 and refit.
-
----
-
-### Phase 8: Documentation
-
-`README.md`:
-- What Primal is (2-3 sentences, plain English)
-- Single install command: `pip install -e .`
-- Run tests: `pytest tests/test_logic.py`, `python tests/test_breakout.py`, `python tests/test_mnist.py`
-- Table: each brain module, 2-sentence description in plain English
-- Expected output for each test
-
----
-
-## Rules that do not bend
-
-**Sub-symbolic only.** No string labels. No hardcoded "if ball then X". No fixed action policies. No domain-specific feature engineering. The agent discovers everything from raw observations.
-
-**Minimum AND maximum lines.** Every module must be above its minimum line count (see Definition of Done section). No single module should exceed 200 lines. The entire `brain/` folder must be between 1500 and 3000 lines. Under 1500 means you skipped implementations. Over 3000 means you are over-engineering.
-
-**No deep learning libraries.** No PyTorch. No TensorFlow. No JAX. No Keras. If you feel the urge, you are avoiding a math problem. Solve the math problem.
-
-**Verify math, not just execution.** A function that runs and returns NaN is worse than one that fails loudly. Use `np.testing.assert_allclose`. Add assertions in dev mode.
-
-**Fix problems in order.** FE math first. GMM stability second. Brain modules third. Wiring fourth. Performance last.
-
-**No em dashes in code comments or docs.** Use commas or periods.
-
-**Do not be arrogant.** Come back to this file when lost. It is here.
-
----
-
-## Performance targets
-
-| Test | Hard requirement | What failure means |
-|---|---|---|
-| Breakout ep2 score | >= 30 bricks | agent not tracking ball; action pipeline broken |
-| Breakout paddle alignment | >= 0.60 (moves toward ball 60% of steps) | agent moving randomly, not reacting to ball position |
-| Breakout ep2 entropy | in [0.05, 0.80] | below 0.05 = action collapse; above 0.80 = pure random walk |
-| Breakout score improvement | ep2 > ep1 strictly | no learning happening between episodes |
-| Breakout speed | >= 10 it/s | profile LBM and Gabor; both must be vectorized |
-| RAM | <= 2GB steady state | GMM growing unbounded; BMR schedule broken |
-| MNIST accuracy | >= 0.90 on all 10,000 samples | visual pipeline broken; debug occipital then PCA dims |
-| MNIST learning slots | exactly 10 after learning phase | BMR too aggressive; raise merge threshold for learning |
-| Codebase size | >= 3000 lines in brain/, >= 3500 total | stubs not implementations; audit every module |
-
----
-
-## Dependencies
-
-```toml
-dependencies = [
-    "numpy>=1.26",
-    "scipy>=1.12",
-    "ale-py>=0.9",                   # ROMs bundled, no AutoROM needed
-    "gymnasium[atari]>=1.0",         # Atari wrappers, requires gym.register_envs(ale_py)
-    "scikit-learn>=1.4",             # MNIST loading only
-    "psutil>=5.9",                   # RAM tracking
-    "opencv-python-headless>=4.9",   # Fast image ops, no display
-    "tqdm>=4.66",                    # Progress bars
-]
-```
-
-Do not add anything else.
-
----
-
-## Quick reference: web searches for implementation detail
-
-When you need more detail, search these:
-
-| Topic | Search query or URL |
-|---|---|
-| D2Q9 weights and velocities | "D2Q9 lattice Boltzmann weights velocities wiki" |
-| LBM BGK collision | "lattice Boltzmann BGK collision operator tau relaxation" |
-| LBM bounce-back boundaries | "lattice Boltzmann half-way bounce-back boundary" |
-| LBM reference | http://wiki.palabos.org/numerics:lbm_reference |
-| Normal-Wishart conjugate | "Normal-Wishart distribution conjugate prior Bayesian GMM" |
-| BMR paper | "Karl Friston Bayesian Model Reduction 2016" |
-| Merging Gaussian components | "merging Gaussian components mixture model parallel covariance" |
-| KL divergence Gaussians | "KL divergence two Gaussians closed form" |
-| AIF tutorial | "active inference tutorial Parr Friston 2022 textbook" |
-| Spelke core knowledge | "Elizabeth Spelke core knowledge systems review 2007" |
-| Gabor filters visual cortex | "Gabor filter V1 orientation selectivity parameters" |
-| DoG retinal ganglion | "difference of Gaussians retinal ganglion center surround" |
-| Magnocellular vs parvocellular | "magnocellular parvocellular pathway review" |
-| Dorsal vs ventral stream | "dorsal ventral visual stream what where pathway" |
-| Weber-Fechner | "Weber-Fechner law psychophysics just noticeable difference" |
-| Kalman filter | "Kalman filter tutorial equations update predict" |
-| ALE ROM bundling | https://ale.farama.org/release_notes/index.html |
-| Gymnasium ALE registration | https://gymnasium.farama.org/gymnasium_release_notes/index.html |
-| ale-py PyPI | https://pypi.org/project/ale-py/ |
-
----
-
-## DEFINITION OF DONE (read this before claiming anything is finished)
-
-This section exists because agents tend to interpret partial progress as completion. Do not mark the task as done until every single item below is checked with actual printed proof in the terminal output.
-
-### Codebase minimums (check with `wc -l`)
-
-```
-brain/active_inference.py      >= 150 lines   (FE formula, perception update, action generation, expected FE per action)
-brain/log_space_gmm.py         >= 250 lines   (E-step, M-step, log-space ops, slot tracking, velocity, Normal-Wishart prior, BME trigger)
-brain/core_knowledge.py        >= 220 lines   (all 5 Spelke systems: object continuity, agent flagging, ANS cardinality, spatial geometry, social contingency)
-brain/theory_theory.py         >= 130 lines   (hypothesis set, scoring, Bayesian averaging, perturbation generator, pruning)
-brain/bmr.py                   >= 120 lines   (KL divergence, symmetric KL, merge logic, parallel covariance formula, prune, schedule)
-brain/brain_mechanisms.py      >= 250 lines   (PFC temperature, retina Gaussian weighting, hippocampus circular buffer, ITC contrast sharpening, homeostasis, ATL)
-brain/weber_fechner.py         >= 60 lines    (precision function, per-dimension weighting, application helpers)
-brain/hemifield.py             >= 120 lines   (bilateral split, per-hemifield pipeline runner, pull imbalance, FE-weighted merge)
-brain/survival_alpha.py        >= 80 lines    (urgency signal, reward running mean, alpha scaling, proprioception uncertainty feed-in)
-brain/lbm_physics.py           >= 180 lines   (D2Q9 init, streaming step, BGK collision, equilibrium distribution, bounce-back BCs, mass conservation check, 18-step loop)
-brain/proprioception.py        >= 120 lines   (state vector, prediction step, Kalman update, noise covariances, uncertainty output)
-brain/temporal_decay.py        >= 60 lines    (0.7/0.3 decay, per-slot application, convergence helpers)
-brain/renormalization.py       >= 120 lines   (3-scale downsampling, per-scale pipeline runner, FE-weighted merge, feature concatenation)
-brain/common_sense.py          >= 120 lines   (gap detection, cosine similarity retrieval, top-3 weighted average, threshold logic)
-brain/cerebellar_smoothing.py  >= 70 lines    (EMA on action probs, logit smoothing, episode reset, separate smoothing state per agent)
-brain/superior_colliculus.py   >= 100 lines   (contrast computation, motion energy, saliency map, top-K peak extraction, hemifield integration)
-brain/occipital.py             >= 280 lines   (DoG on/off, end-stopped cells, 24 Gabor filters precomputed, V1/V2/V4 hierarchy, PCA fit/project, feature assembly)
-brain/visual_streams.py        >= 150 lines   (M-path low-pass + downsample, P-path high-pass, parallel processing, ventral/dorsal routing, output merging)
-brain/saccades.py              >= 120 lines   (microsaccade jitter, SC-driven fixation selection, 3-fixation sequence, foveal patch extraction, feature merging)
-agent.py                       >= 200 lines   (full PrimalAgent class, act pipeline, update pipeline, reset, episode tracking, FE history, all modules wired)
-Total brain/ folder            >= 3000 lines
-Total project (all .py files)  >= 3500 lines
-```
-
-If any module is below its minimum, it is a stub, not an implementation. Do not proceed. Do not try to hide the shortfall by adding blank lines or comments. The minimums count executable, meaningful lines of logic, not whitespace or docstrings.
-
-**What a stub looks like (WRONG):**
-```python
-def compute_fe(obs, mu, sigma):
-    # TODO: implement
-    return 0.0
-```
-
-**What a real implementation looks like (RIGHT):**
-```python
-def compute_fe(obs, mu, Sigma_inv, log_det_Sigma, d):
-    diff = obs - mu
-    mahal = float(diff @ Sigma_inv @ diff)
-    return 0.5 * (mahal + log_det_Sigma + d * np.log(2 * np.pi))
-```
-
-Every function must have actual math, actual numpy operations, actual logic. No `pass`. No `return None` where a value is expected. No `# TODO`. No placeholder returns.
-
-Run this to check all at once:
-
-```bash
-for f in primal/brain/*.py primal/agent.py; do
-    count=$(wc -l < "$f")
-    echo "$count $f"
-done
-echo "Total brain/: $(cat primal/brain/*.py | wc -l) lines"
-```
-
-### Breakout mastery criteria (all must be printed as PASS)
-
-The bar here is mastery within 2 episodes, not just "hit something by accident." The agent needs to demonstrate that it has learned to track the ball and actively direct the paddle toward it. Lucky collisions and random walks do not count.
-
-```
-PASS: ep2 score >= 30         # 30 bricks broken is not luck; it requires sustained ball tracking
-PASS: ep2 paddle_alignment >= 0.60   # paddle moves toward ball >= 60% of steps (measured below)
-PASS: ep2 entropy in [0.05, 0.80]    # not collapsed, not purely random
-PASS: ep1_to_ep2_score_improvement > 0   # ep2 score strictly greater than ep1 score
-PASS: it/s >= 10.0
-PASS: ram_gb <= 2.0
-```
-
-**How to compute paddle_alignment:** On each step, compute `sign(ball_x - paddle_x)`. If the action taken matches that sign (agent moves toward ball) or the paddle is already within 4px of the ball (no movement needed), count it as aligned. `paddle_alignment = aligned_steps / total_steps`.
-
-A score of 1-5 with no improvement from episode 1 to 2 is not mastery. It is a lucky collision followed by a broken agent. Do not accept it.
-
-A score of 0 in episode 2 is a hard failure. The action pipeline is broken. Debug before moving on.
-
-Entropy=0.000 or entropy=-0.000 is a hard failure. That is action collapse (same action every step), not learning. Debug before moving on.
-
-**What distinguishes mastery from luck:**
-- Lucky agents get occasional points then die immediately after. Paddle does not track the ball between contacts.
-- Mastering agents move the paddle continuously toward the ball after each launch. Paddle alignment is above 0.60 even on steps where there is no immediate reward.
-- If you see a score of 3 in episode 1 and 4 in episode 2 with paddle_alignment of 0.3, that is random movement with occasional contact, not mastery. Keep debugging.
-
-**If score >= 30 seems hard to reach in 2 episodes:** it is not. A Breakout episode with Primal's visual pipeline should be straightforward because:
-1. The ball and paddle are the two highest-motion-energy slots. The M-path identifies them in episode 1.
-2. The agent's action space has only 4 actions (NOOP, FIRE, LEFT, RIGHT). Reducing FE by moving the paddle under the predicted ball position is a near-trivial one-step lookahead.
-3. By episode 2, the hippocampus buffer has high-FE events (ball missing paddle) replayed, which trains the model to avoid those states.
-
-If the agent is not reaching 30 by episode 2, the visual feature extraction or action selection is broken, not the target being too high.
-
-**Debug order for score < 30:**
-
-1. Print ball slot position and paddle slot position every 10 steps. Are they being tracked as distinct slots? If ball and paddle are merged into one slot, slot assignment is broken (Spelke object continuity threshold too loose).
-
-2. Print action_values for all 4 actions every 50 steps. Are they different from each other? If all equal, the generative model is not distinguishing consequences of actions. The action prediction head is broken.
-
-3. Print paddle_alignment every episode. If below 0.4, the agent is not moving toward the ball. Check whether (ball_x - paddle_x) is even being computed in the action selection path.
-
-4. Print whether the LBM prediction matches the ball's actual next position (error in pixels). If LBM error is above 10px consistently, the physics prior is not helping. Check D2Q9 initialization and boundary conditions.
-
-5. Check whether survival_alpha is stuck at alpha_max. If the agent always operates at maximum precision, temperature is always near zero, which gives near-deterministic action selection on whatever the GMM happened to initialize to. Add some initial entropy by ensuring temperature starts above 0.5.
-
-### MNIST success criteria (all must be true, printed as PASS)
-
-```
-PASS: agent.gmm.n_components >= 10 after learning phase (BMR was disabled during learning)
-PASS: slot_to_class has exactly 10 entries (one per class)
-PASS: pairwise cosine similarity between all 10 slot means is below 0.98 (slots are distinct)
-PASS: accuracy on all 10,000 test samples >= 0.90
-PASS: test ran without crashing on unknown-class inputs
-```
-
-If `n_components < 10` after learning, the only cause is BMR merging prototypes or GMM not opening new slots. Fix: ensure `agent.bmr.enabled = False` and `agent.gmm.novelty_threshold = 0.0` during the learning phase.
-
-Accuracy = 0.10 means random guessing. This is not "a low score" or "partially working." It means the classifier has exactly 0 useful information. Debug starts at slot count, not at hyperparameter tuning.
-
-### MNIST download fallback
-
-`sklearn.datasets.fetch_openml` requires `pandas`. If pandas is not installed or causes issues, use this fallback instead:
-
-```python
-import urllib.request, gzip, numpy as np, os
-
-def load_mnist_fallback(path="/tmp/mnist"):
-    os.makedirs(path, exist_ok=True)
-    base = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-    files = {
-        "train_images": "train-images-idx3-ubyte.gz",
-        "train_labels": "train-labels-idx1-ubyte.gz",
-        "test_images":  "t10k-images-idx3-ubyte.gz",
-        "test_labels":  "t10k-labels-idx1-ubyte.gz",
-    }
-    for key, fname in files.items():
-        fpath = os.path.join(path, fname)
-        if not os.path.exists(fpath):
-            urllib.request.urlretrieve(base + fname, fpath)
-
-    def read_images(fname):
-        with gzip.open(os.path.join(path, fname)) as f:
-            f.read(16)
-            return np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 784).astype(np.float32) / 255.0
-
-    def read_labels(fname):
-        with gzip.open(os.path.join(path, fname)) as f:
-            f.read(8)
-            return np.frombuffer(f.read(), dtype=np.uint8)
-
-    return (
-        read_images("train-images-idx3-ubyte.gz"),
-        read_labels("train-labels-idx1-ubyte.gz"),
-        read_images("t10k-images-idx3-ubyte.gz"),
-        read_labels("t10k-labels-idx1-ubyte.gz"),
-    )
-```
-
-Always try fetch_openml first. If it raises any exception (ImportError, pandas missing, network timeout), immediately fall back to `load_mnist_fallback`. Do not let a pandas dependency block the MNIST test.
-
-### Hard stop gates between phases
-
-These are not suggestions. They are required checkpoints.
-
-**Before Phase 2:** Run `python verify_math.py`. All 10 checks must print PASS. If any print FAIL, fix that module before writing any brain mechanism code.
-
-**Before Phase 6:** Run `pytest tests/test_logic.py -v`. All 15 tests must show PASSED. Zero failures, zero errors. If any fail, fix them before running Breakout.
-
-**Before Phase 7:** Breakout must print PASS for all 5 criteria: ep2 score >= 30, paddle_alignment >= 0.60, entropy in [0.05, 0.80], ep2 > ep1 score, it/s >= 10. The speed gate (200-step warmup timing) must have passed first. If any criteria fail, STOP. Do not run MNIST. Fix Breakout first. A score of 1-5 with lucky alignment is not a pass. A smoke run of 150 steps is not Breakout.
-
-**Before Phase 8:** MNIST must show accuracy >= 0.90 on 10,000 samples. If below 0.90, STOP. Do not write README. Debug MNIST first.
-
-The task is not done until Phase 8 is complete with all criteria met. Printing "task complete" or moving to documentation while any test is failing or skipped is not acceptable.
-
-### Self-audit checklist (run this mentally before claiming done)
-
-```
-[ ] brain/ folder >= 3000 lines (run: cat primal/brain/*.py | wc -l)
-[ ] every module above its individual minimum (run the wc -l loop)
-[ ] no module contains "pass", "TODO", or a placeholder return
-[ ] verify_math.py all 10 checks PASS
-[ ] pytest tests/test_logic.py all 15 tests PASSED
-[ ] Speed gate: 200-step timing gives >= 10 it/s (printed before Phase 6)
-[ ] Breakout test used full episodes, no max_steps below 10,000
-[ ] Breakout ep2 score >= 30 (printed in terminal)
-[ ] Breakout ep2 paddle_alignment >= 0.60 (printed in terminal)
-[ ] Breakout ep2 entropy in [0.05, 0.80] (printed in terminal)
-[ ] Breakout ep2 score > ep1 score (printed in terminal)
-[ ] Breakout it/s >= 10 during episode (printed in terminal)
-[ ] agent.bmr.enabled = False was set before MNIST learning phase
-[ ] agent.gmm.novelty_threshold = 0.0 was set before MNIST learning phase
-[ ] MNIST slot count == 10 after learning (printed in terminal)
-[ ] MNIST pairwise cosine similarity < 0.98 for all slot pairs (printed)
-[ ] MNIST accuracy >= 0.90 on all 10,000 samples (printed in terminal)
-[ ] MNIST fallback implemented (no hard pandas dependency)
-[ ] README.md exists and documents every module
-[ ] LICENSE exists with Primeval Company name
-[ ] pyproject.toml is complete and installs cleanly
-[ ] TODO.md exists with all phases filled in, actual terminal output pasted, no [PASTE HERE] remaining
-```
-
-If any box is unchecked, the task is not done.
-
+* **The Benchmark**: With a correct full implementation, it should master the physics game under 2 episodes or with 3 lives left. Track the outputs closely. 
+* **Terminal Debugging Loop**: Just like in Phase 2, you must capture the standard output, stack traces, and performance metrics from the terminal. Output them directly into the conversation so I can check your work. If the benchmarks are not met, read the terminal output, deep think about what went wrong, and fix the code. Do not just output failing code. Iterate until it works. If after 3 genuine attempts at a specific failure you are still stuck, do not keep guessing. Write a `## Stuck` section at the bottom of `TODO.md` describing exactly what is failing, what you have already tried, and what the terminal output says. I will read it and send you a targeted fix. Guessing blindly past 3 attempts wastes time and risks breaking things that already work.
+* **Performance Check**: Track the iterations per second and RAM usage in the terminal logs. If the CPU is suffering or RAM usage is huge, you must read the logs, debug, and optimize the numpy/scipy operations. LBM and Gabor filtering are the two operations most likely to be slow. Both must use vectorized numpy without any Python loops over grid cells or pixels. Note that the LBM outer loop over 9 lattice directions is fine: that is O(9) and constant. The forbidden pattern is an inner loop over grid cells: `for x in range(W): for y in range(H)`. That is O(W×H) Python iterations and will destroy performance.
+
+### Phase 5: Final Output
+Once the plan is executed, the code is written, and the verification loop is successful, compile all the final files. Document everything clearly in a `README.md` explaining how to run the agent, how the brain modules work together, and how to replicate the massive MNIST and Gymnasium tests. Ensure the `TODO.md` shows all tasks completed. Show me the final package.

@@ -1,0 +1,74 @@
+{
+  "physics": [
+    {
+      "environment": "CartPole-v1",
+      "episodes": 6,
+      "episode_rewards": [
+        53.0,
+        500.0,
+        500.0,
+        500.0,
+        500.0,
+        500.0
+      ],
+      "episode_steps": [
+        53,
+        500,
+        500,
+        500,
+        500,
+        500
+      ],
+      "free_energy_mean": 87.17558145102755,
+      "prediction_error_mean": 0.04642308431776323,
+      "steps_per_second": 14.543576661103899,
+      "ram_mb": 121.5859375
+    },
+    {
+      "environment": "CartPole-v1",
+      "episodes": 6,
+      "episode_rewards": [
+        51.0,
+        500.0,
+        500.0,
+        500.0,
+        500.0,
+        500.0
+      ],
+      "episode_steps": [
+        51,
+        500,
+        500,
+        500,
+        500,
+        500
+      ],
+      "free_energy_mean": 63.75564880141638,
+      "prediction_error_mean": 0.043779489499178016,
+      "steps_per_second": 16.319294145053288,
+      "ram_mb": 129.734375
+    }
+  ],
+  "vision": {
+    "dataset": "torchvision_mnist",
+    "samples_per_digit": 1,
+    "train_size": 10,
+    "differ_train_pool_size": 60000,
+    "test_size": 10000,
+    "gmm_components": 18,
+    "confidence_mean": 0.22971437833258296,
+    "accuracy": 0.9264,
+    "per_digit_accuracy": {
+      "0": 0.9897959183673469,
+      "1": 0.9885462555066079,
+      "2": 0.8701550387596899,
+      "3": 0.8792079207920792,
+      "4": 0.9501018329938901,
+      "5": 0.8890134529147982,
+      "6": 0.9342379958246346,
+      "7": 0.872568093385214,
+      "8": 0.9568788501026694,
+      "9": 0.9276511397423192
+    }
+  }
+}

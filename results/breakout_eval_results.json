@@ -1,0 +1,25 @@
+{
+  "episodes": [
+    {
+      "episode": 1,
+      "score": 1.0,
+      "steps": 12000,
+      "start_lives": 5,
+      "min_lives": 4,
+      "end_lives": 4
+    },
+    {
+      "episode": 2,
+      "score": 1.0,
+      "steps": 12000,
+      "start_lives": 5,
+      "min_lives": 4,
+      "end_lives": 4
+    }
+  ],
+  "config": {
+    "episodes": 2,
+    "max_steps": 12000
+  },
+  "criterion_episode1_lives_left_ge_2": true
+}

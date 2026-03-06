@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cheap-universal-agi"
+version = "0.1.0"
+description = "Blueprint-driven NumPy/SciPy active-inference architecture"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "gymnasium>=1.0",
+  "ale-py>=0.9",
+  "tqdm",
+  "pillow",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

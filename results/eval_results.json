@@ -1,0 +1,60 @@
+{
+  "breakout": {
+    "episodes": 1,
+    "first_positive_step": 39,
+    "life_events": [
+      {
+        "episode": 0,
+        "from": 5,
+        "step": 70,
+        "to": 4
+      }
+    ],
+    "max_steps": 6000,
+    "one_shot_success": true,
+    "positive_rewards": 1,
+    "task": "breakout_active_inference",
+    "total_reward": 1.0
+  },
+  "mnist": {
+    "accuracy": 0.9261,
+    "elapsed_seconds": 33.543357133865356,
+    "fit_info": {
+      "bootstrap_examples": 15000,
+      "replay_examples": 20000,
+      "support_indices": {
+        "0": 15770,
+        "1": 11509,
+        "2": 16269,
+        "3": 16243,
+        "4": 13451,
+        "5": 5383,
+        "6": 12191,
+        "7": 14770,
+        "8": 15782,
+        "9": 3649
+      },
+      "train_embedding_shape": [
+        20000,
+        1296
+      ],
+      "train_pool_limit": 20000
+    },
+    "per_class_accuracy": {
+      "0": 0.972449004650116,
+      "1": 0.9136564135551453,
+      "2": 0.934108555316925,
+      "3": 0.9316831827163696,
+      "4": 0.9185336232185364,
+      "5": 0.9125560522079468,
+      "6": 0.9405010342597961,
+      "7": 0.9017509818077087,
+      "8": 0.907597541809082,
+      "9": 0.9296333193778992
+    },
+    "rgm_fit_limit": 2000,
+    "support_mode": "medoid",
+    "task": "mnist_one_shot",
+    "train_pool_limit": 20000
+  }
+}

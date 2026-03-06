@@ -1,0 +1,22 @@
+[project]
+name = "cheap-universal-agi"
+version = "0.1.0"
+description = "Blueprint-driven active inference architecture in NumPy and SciPy."
+requires-python = ">=3.12"
+dependencies = [
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "scikit-image",
+  "pillow",
+  "gymnasium",
+  "ale-py",
+  "tqdm",
+]
+
+[project.scripts]
+blueprint-agi = "blueprint_agi:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

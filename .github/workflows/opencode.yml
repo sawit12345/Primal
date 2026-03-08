@@ -404,19 +404,21 @@ jobs:
             echo "Using Tailscale Funnel..."
             tailscale status || true
 
-            # Clean up any prior Funnel config on this runner
             tailscale funnel reset >/dev/null 2>&1 || true
 
-            # Expose OpenChamber publicly via Funnel
-            tailscale funnel --bg --yes 9090 > tunnel.log 2>&1
+            if ! tailscale funnel --bg --yes 9090 > tunnel.log 2>&1; then
+              echo "Tailscale Funnel failed:"
+              cat tunnel.log || true
+              tailscale funnel status || true
+              exit 1
+            fi
+
             sleep 5
 
             URL=$(tailscale funnel status --json 2>/dev/null | jq -r '.. | strings | select(test("^https://"))' | head -n 1)
             if [ -z "$URL" ]; then
               echo "Could not determine Tailscale Funnel URL"
-              echo "Tailscale funnel status output:"
               tailscale funnel status --json || true
-              echo "Tunnel log:"
               cat tunnel.log || true
               exit 1
             fi

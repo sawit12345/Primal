@@ -160,14 +160,17 @@ jobs:
       # TAILSCALE: Auth Key
       # Requires GitHub secret:
       # - TAILSCALE_AUTHKEY
-      # Best if the auth key is tagged, reusable, ephemeral,
-      # and pre-approved if your tailnet uses device approval.
+      # The auth key can already carry tag:ci, so no extra tags: input needed
       # ============================================================
       - name: Connect to Tailscale
         if: ${{ github.event.inputs.tunnel_provider == 'tailscale' }}
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Allow runner user to manage Tailscale
+        if: ${{ github.event.inputs.tunnel_provider == 'tailscale' }}
+        run: sudo tailscale set --operator="$USER"
 
       - name: Configure OpenCode (Complete Antigravity Suite)
         run: |
@@ -404,8 +407,10 @@ jobs:
             echo "Using Tailscale Funnel..."
             tailscale status || true
 
+            # Clean up any previous Funnel config on this ephemeral runner
             tailscale funnel reset >/dev/null 2>&1 || true
 
+            # Expose OpenChamber publicly via Funnel
             if ! tailscale funnel --bg --yes 9090 > tunnel.log 2>&1; then
               echo "Tailscale Funnel failed:"
               cat tunnel.log || true
@@ -415,14 +420,16 @@ jobs:
 
             sleep 5
 
-            URL=$(tailscale funnel status --json 2>/dev/null | jq -r '.. | strings | select(test("^https://"))' | head -n 1)
+            URL=$(tailscale funnel status 2>/dev/null | grep -Eo 'https://[^ ]+' | head -n 1)
             if [ -z "$URL" ]; then
               echo "Could not determine Tailscale Funnel URL"
-              tailscale funnel status --json || true
+              echo "Tailscale funnel status output:"
+              tailscale funnel status || true
+              echo "Tunnel log:"
               cat tunnel.log || true
               exit 1
             fi
-
+            
             echo "URL=$URL" >> "$GITHUB_ENV"
 
           elif [[ "${{ github.event.inputs.tunnel_provider }}" == "ngrok" ]]; then
@@ -463,7 +470,7 @@ jobs:
               if [[ "${{ github.event.inputs.tunnel_provider }}" == "tailscale" ]]; then
                 tailscale funnel reset >/dev/null 2>&1 || true
               fi
-
+              
               pkill -f "opencode|openchamber|ngrok|cloudflared" 2>/dev/null || true
               break
             fi
@@ -497,12 +504,16 @@ jobs:
               fi
 
             else
-              if ! tailscale funnel status --json 2>/dev/null | jq -e '.. | strings | select(test("proxy http://127.0.0.1:9090"))' >/dev/null; then
+              if ! tailscale funnel status 2>/dev/null | grep -q 'https://'; then
                 echo "[$(date)] Re-hosting Tailscale Funnel..."
-                tailscale funnel --bg --yes 9090 > tunnel.log 2>&1
-                sleep 5
-                URL=$(tailscale funnel status --json 2>/dev/null | jq -r '.. | strings | select(test("^https://"))' | head -n 1)
-                echo "NEW LINK: $URL"
+                if tailscale funnel --bg --yes 9090 > tunnel.log 2>&1; then
+                  sleep 5
+                  URL=$(tailscale funnel status 2>/dev/null | grep -Eo 'https://[^ ]+' | head -n 1)
+                  echo "NEW LINK: $URL"
+                else
+                  echo "[$(date)] Tailscale Funnel restart failed:"
+                  cat tunnel.log || true
+                fi
               fi
             fi
             

@@ -41,11 +41,11 @@ jobs:
         run: |
           mkdir -p ~/repos
           cd ~/repos
-          
+
           repos=$(curl -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/user/repos?per_page=100&affiliation=owner" \
             | jq -r '.[].clone_url')
-          
+
           for repo in $repos; do
             echo "Cloning $repo..."
             git clone https://$GH_TOKEN@${repo#https://} || true
@@ -68,51 +68,51 @@ jobs:
           echo "=== RESTORE DEBUG ==="
           echo "Contents of /tmp/opencode-restore:"
           ls -la /tmp/opencode-restore/ 2>/dev/null || echo "Directory does not exist"
-          
+
           if [ -d "/tmp/opencode-restore" ]; then
             echo "Found restore directory, checking contents..."
             find /tmp/opencode-restore -type f 2>/dev/null || echo "No files found"
-            
+
             mkdir -p ~/.config/opencode ~/.local/share/opencode/project ~/.local/state/opencode
             mkdir -p ~/.config/openchamber
-            
+
             if [ -d "/tmp/opencode-restore/config" ]; then
               echo "Restoring OpenCode config files..."
               cp -rv /tmp/opencode-restore/config/* ~/.config/opencode/ 2>/dev/null || true
             fi
-            
+
             if [ -d "/tmp/opencode-restore/openchamber" ]; then
               echo "Restoring OpenChamber config files..."
               cp -rv /tmp/opencode-restore/openchamber/* ~/.config/openchamber/ 2>/dev/null || true
             fi
-            
+
             if [ -f "/tmp/opencode-restore/auth.json" ]; then
               echo "Restoring auth.json..."
               cp -v /tmp/opencode-restore/auth.json ~/.local/share/opencode/auth.json 2>/dev/null || true
             fi
-            
+
             if [ -f "/tmp/opencode-restore/opencode.db" ]; then
               echo "Restoring SQLite database..."
               cp -v /tmp/opencode-restore/opencode.db* ~/.local/share/opencode/ 2>/dev/null || true
             fi
-            
+
             if [ -d "/tmp/opencode-restore/state" ]; then
               echo "Restoring state directory..."
               cp -rv /tmp/opencode-restore/state/* ~/.local/state/opencode/ 2>/dev/null || true
             fi
-            
+
             if [ -d "/tmp/opencode-restore/project" ]; then
               echo "Restoring project sessions..."
               cp -rv /tmp/opencode-restore/project/* ~/.local/share/opencode/project/ 2>/dev/null || true
               echo "Sessions restored: $(find ~/.local/share/opencode/project -type f 2>/dev/null | wc -l) files"
             fi
-            
+
             if [ -d "/tmp/opencode-restore/storage" ]; then
               echo "Restoring legacy storage..."
               mkdir -p ~/.local/share/opencode/storage
               cp -rv /tmp/opencode-restore/storage/* ~/.local/share/opencode/storage/ 2>/dev/null || true
             fi
-            
+
             echo "Session restored successfully!"
           else
             echo "No previous session found. Fresh start."
@@ -135,7 +135,8 @@ jobs:
       - name: Install Tools
         run: |
           npm install -g opencode-ai @openchamber/web
-          sudo apt update && sudo apt install jq lsof coreutils curl -y
+          sudo apt update
+          sudo apt install jq lsof coreutils curl openssl dnsutils -y
 
       - name: Connect to Tailscale
         if: ${{ github.event.inputs.tunnel_provider == 'tailscale' }}
@@ -175,11 +176,25 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "none": { "reasoningEffort": "none" },
-                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
-                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
-                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
-                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
+                      "none": {
+                        "reasoningEffort": "none"
+                      },
+                      "low": {
+                        "reasoningEffort": "low",
+                        "reasoningSummary": "detailed"
+                      },
+                      "medium": {
+                        "reasoningEffort": "medium",
+                        "reasoningSummary": "detailed"
+                      },
+                      "high": {
+                        "reasoningEffort": "high",
+                        "reasoningSummary": "detailed"
+                      },
+                      "xhigh": {
+                        "reasoningEffort": "xhigh",
+                        "reasoningSummary": "detailed"
+                      }
                     }
                   },
                   "gpt-5.3-codex": {
@@ -194,10 +209,22 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
-                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
-                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
-                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
+                      "low": {
+                        "reasoningEffort": "low",
+                        "reasoningSummary": "detailed"
+                      },
+                      "medium": {
+                        "reasoningEffort": "medium",
+                        "reasoningSummary": "detailed"
+                      },
+                      "high": {
+                        "reasoningEffort": "high",
+                        "reasoningSummary": "detailed"
+                      },
+                      "xhigh": {
+                        "reasoningEffort": "xhigh",
+                        "reasoningSummary": "detailed"
+                      }
                     }
                   }
                 }
@@ -222,11 +249,25 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "none": { "reasoningEffort": "none" },
-                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
-                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
-                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
-                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
+                      "none": {
+                        "reasoningEffort": "none"
+                      },
+                      "low": {
+                        "reasoningEffort": "low",
+                        "reasoningSummary": "detailed"
+                      },
+                      "medium": {
+                        "reasoningEffort": "medium",
+                        "reasoningSummary": "detailed"
+                      },
+                      "high": {
+                        "reasoningEffort": "high",
+                        "reasoningSummary": "detailed"
+                      },
+                      "xhigh": {
+                        "reasoningEffort": "xhigh",
+                        "reasoningSummary": "detailed"
+                      }
                     }
                   },
                   "gpt-5.3-codex": {
@@ -241,10 +282,22 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
-                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
-                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
-                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
+                      "low": {
+                        "reasoningEffort": "low",
+                        "reasoningSummary": "detailed"
+                      },
+                      "medium": {
+                        "reasoningEffort": "medium",
+                        "reasoningSummary": "detailed"
+                      },
+                      "high": {
+                        "reasoningEffort": "high",
+                        "reasoningSummary": "detailed"
+                      },
+                      "xhigh": {
+                        "reasoningEffort": "xhigh",
+                        "reasoningSummary": "detailed"
+                      }
                     }
                   }
                 }
@@ -324,7 +377,7 @@ jobs:
         run: |
           nohup stdbuf -oL opencode web --port 8080 > opencode.log 2>&1 &
           nohup stdbuf -oL openchamber --port 9090 > openchamber.log 2>&1 &
-          
+
           echo "Waiting for OpenChamber to listen on 9090..."
           for i in {1..60}; do
             if lsof -i :9090 >/dev/null 2>&1; then
@@ -340,11 +393,10 @@ jobs:
             cat openchamber.log || true
             exit 1
           fi
-          
+
           if [[ "${{ github.event.inputs.tunnel_provider }}" == "tailscale" ]]; then
             echo "Using Tailscale Funnel..."
             tailscale status || true
-
             tailscale funnel reset >/dev/null 2>&1 || true
 
             if ! tailscale funnel --bg --yes http://127.0.0.1:9090 > tunnel.log 2>&1; then
@@ -382,6 +434,47 @@ jobs:
             echo "URL=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel.log | tail -n 1)" >> "$GITHUB_ENV"
           fi
 
+      - name: Debug Tailscale Funnel
+        if: ${{ github.event.inputs.tunnel_provider == 'tailscale' }}
+        continue-on-error: true
+        run: |
+          echo "=== URL FROM ENV ==="
+          echo "${{ env.URL }}"
+
+          HOST=$(echo "${{ env.URL }}" | sed 's#https://##; s#/##')
+          echo "HOST=$HOST"
+
+          echo "=== LOCAL APP CHECK ==="
+          curl -svI http://127.0.0.1:9090/ || true
+
+          echo "=== TAILSCALE STATUS ==="
+          tailscale status || true
+
+          echo "=== FUNNEL STATUS ==="
+          tailscale funnel status || true
+          tailscale funnel status --json || true
+
+          echo "=== SYSTEM DNS ==="
+          getent ahosts "$HOST" || true
+
+          echo "=== PUBLIC DNS VIA 1.1.1.1 ==="
+          dig +short "$HOST" @1.1.1.1 || true
+
+          echo "=== PUBLIC DNS VIA 8.8.8.8 ==="
+          dig +short "$HOST" @8.8.8.8 || true
+
+          echo "=== TLS HANDSHAKE ==="
+          timeout 15 bash -lc "echo | openssl s_client -connect ${HOST}:443 -servername ${HOST}" || true
+
+          echo "=== HTTPS HEAD ==="
+          curl -vkI "https://${HOST}/" || true
+
+          echo "=== OPENCHAMBER LOG (TAIL 100) ==="
+          tail -n 100 openchamber.log || true
+
+          echo "=== TUNNEL LOG ==="
+          cat tunnel.log || true
+
       - name: Monitor & Self-Heal
         run: |
           echo "------------------------------------------"
@@ -389,29 +482,29 @@ jobs:
           echo "AUTO-SHUTDOWN IN: ${{ github.event.inputs.timeout_minutes }} minute(s)"
           echo "All your repos available at: ~/repos/"
           echo "------------------------------------------"
-          
+
           START_TIME=$(date +%s)
           TIMEOUT_SECONDS=$(( ${{ github.event.inputs.timeout_minutes }} * 60 ))
-          
+
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
             REMAINING=$(( TIMEOUT_SECONDS - ELAPSED ))
-            
+
             if [ $REMAINING -le 0 ]; then
               echo "[$(date)] Timeout reached. Initiating graceful shutdown..."
 
               if [[ "${{ github.event.inputs.tunnel_provider }}" == "tailscale" ]]; then
                 tailscale funnel reset >/dev/null 2>&1 || true
               fi
-              
+
               pkill -f "opencode|openchamber|ngrok|cloudflared" 2>/dev/null || true
               break
             fi
-            
+
             if [ $(( ELAPSED % 300 )) -lt 10 ]; then
               echo "[$(date)] Time remaining: $(( REMAINING / 60 )) minutes"
             fi
-            
+
             if ! lsof -i :9090 > /dev/null; then
               echo "[$(date)] Restoring OpenChamber..."
               nohup stdbuf -oL openchamber --port 9090 >> openchamber.log 2>&1 &
@@ -449,7 +542,7 @@ jobs:
                 fi
               fi
             fi
-            
+
             tail -n 1 openchamber.log
             sleep 5
           done
@@ -459,48 +552,48 @@ jobs:
         run: |
           echo "Preparing session data for persistence..."
           mkdir -p /tmp/opencode-save/config /tmp/opencode-save/openchamber /tmp/opencode-save/project /tmp/opencode-save/state /tmp/opencode-save/storage
-          
+
           if [ -d "$HOME/.config/opencode" ] && [ "$(ls -A "$HOME/.config/opencode" 2>/dev/null)" ]; then
             cp -rv "$HOME/.config/opencode/"* /tmp/opencode-save/config/ 2>/dev/null || true
             echo "OpenCode config saved: $(ls -la /tmp/opencode-save/config/ 2>/dev/null | wc -l) files"
           else
             echo "No OpenCode config data to save"
           fi
-          
+
           if [ -d "$HOME/.config/openchamber" ] && [ "$(ls -A "$HOME/.config/openchamber" 2>/dev/null)" ]; then
             cp -rv "$HOME/.config/openchamber/"* /tmp/opencode-save/openchamber/ 2>/dev/null || true
             echo "OpenChamber config saved: $(find "$HOME/.config/openchamber" -type f 2>/dev/null | wc -l) files"
           else
             echo "No OpenChamber config data to save"
           fi
-          
+
           if [ -f "$HOME/.local/share/opencode/auth.json" ]; then
             cp -v "$HOME/.local/share/opencode/auth.json" /tmp/opencode-save/auth.json 2>/dev/null || true
             echo "Auth data saved"
           fi
-          
+
           if [ -f "$HOME/.local/share/opencode/opencode.db" ]; then
             cp -v "$HOME/.local/share/opencode/opencode.db"* /tmp/opencode-save/ 2>/dev/null || true
             echo "SQLite database saved: $(ls -la /tmp/opencode-save/opencode.db* 2>/dev/null | wc -l) files"
           fi
-          
+
           if [ -d "$HOME/.local/state/opencode" ] && [ "$(ls -A "$HOME/.local/state/opencode" 2>/dev/null)" ]; then
             cp -rv "$HOME/.local/state/opencode/"* /tmp/opencode-save/state/ 2>/dev/null || true
             echo "State data saved: $(find "$HOME/.local/state/opencode" -type f 2>/dev/null | wc -l) files"
           fi
-          
+
           if [ -d "$HOME/.local/share/opencode/project" ] && [ "$(ls -A "$HOME/.local/share/opencode/project" 2>/dev/null)" ]; then
             cp -rv "$HOME/.local/share/opencode/project/"* /tmp/opencode-save/project/ 2>/dev/null || true
             echo "Project sessions saved: $(find "$HOME/.local/share/opencode/project" -type f 2>/dev/null | wc -l) files"
           else
             echo "No project session data to save"
           fi
-          
+
           if [ -d "$HOME/.local/share/opencode/storage" ] && [ "$(ls -A "$HOME/.local/share/opencode/storage" 2>/dev/null)" ]; then
             cp -rv "$HOME/.local/share/opencode/storage/"* /tmp/opencode-save/storage/ 2>/dev/null || true
             echo "Legacy storage saved: $(find "$HOME/.local/share/opencode/storage" -type f 2>/dev/null | wc -l) files"
           fi
-          
+
           if [ "$(find /tmp/opencode-save -type f 2>/dev/null | wc -l)" -gt 0 ]; then
             echo "Session data prepared successfully: $(find /tmp/opencode-save -type f | wc -l) files total"
             ls -la /tmp/opencode-save/

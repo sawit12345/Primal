@@ -175,25 +175,11 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "none": {
-                        "reasoningEffort": "none"
-                      },
-                      "low": {
-                        "reasoningEffort": "low",
-                        "reasoningSummary": "detailed"
-                      },
-                      "medium": {
-                        "reasoningEffort": "medium",
-                        "reasoningSummary": "detailed"
-                      },
-                      "high": {
-                        "reasoningEffort": "high",
-                        "reasoningSummary": "detailed"
-                      },
-                      "xhigh": {
-                        "reasoningEffort": "xhigh",
-                        "reasoningSummary": "detailed"
-                      }
+                      "none": { "reasoningEffort": "none" },
+                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
+                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
+                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
                     }
                   },
                   "gpt-5.3-codex": {
@@ -208,22 +194,10 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "low": {
-                        "reasoningEffort": "low",
-                        "reasoningSummary": "detailed"
-                      },
-                      "medium": {
-                        "reasoningEffort": "medium",
-                        "reasoningSummary": "detailed"
-                      },
-                      "high": {
-                        "reasoningEffort": "high",
-                        "reasoningSummary": "detailed"
-                      },
-                      "xhigh": {
-                        "reasoningEffort": "xhigh",
-                        "reasoningSummary": "detailed"
-                      }
+                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
+                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
+                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
                     }
                   }
                 }
@@ -248,25 +222,11 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "none": {
-                        "reasoningEffort": "none"
-                      },
-                      "low": {
-                        "reasoningEffort": "low",
-                        "reasoningSummary": "detailed"
-                      },
-                      "medium": {
-                        "reasoningEffort": "medium",
-                        "reasoningSummary": "detailed"
-                      },
-                      "high": {
-                        "reasoningEffort": "high",
-                        "reasoningSummary": "detailed"
-                      },
-                      "xhigh": {
-                        "reasoningEffort": "xhigh",
-                        "reasoningSummary": "detailed"
-                      }
+                      "none": { "reasoningEffort": "none" },
+                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
+                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
+                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
                     }
                   },
                   "gpt-5.3-codex": {
@@ -281,22 +241,10 @@ jobs:
                       "output": 128000
                     },
                     "variants": {
-                      "low": {
-                        "reasoningEffort": "low",
-                        "reasoningSummary": "detailed"
-                      },
-                      "medium": {
-                        "reasoningEffort": "medium",
-                        "reasoningSummary": "detailed"
-                      },
-                      "high": {
-                        "reasoningEffort": "high",
-                        "reasoningSummary": "detailed"
-                      },
-                      "xhigh": {
-                        "reasoningEffort": "xhigh",
-                        "reasoningSummary": "detailed"
-                      }
+                      "low": { "reasoningEffort": "low", "reasoningSummary": "detailed" },
+                      "medium": { "reasoningEffort": "medium", "reasoningSummary": "detailed" },
+                      "high": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+                      "xhigh": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" }
                     }
                   }
                 }
@@ -376,7 +324,22 @@ jobs:
         run: |
           nohup stdbuf -oL opencode web --port 8080 > opencode.log 2>&1 &
           nohup stdbuf -oL openchamber --port 9090 > openchamber.log 2>&1 &
-          sleep 20
+          
+          echo "Waiting for OpenChamber to listen on 9090..."
+          for i in {1..60}; do
+            if lsof -i :9090 >/dev/null 2>&1; then
+              echo "OpenChamber is listening on 9090"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! lsof -i :9090 >/dev/null 2>&1; then
+            echo "OpenChamber never started listening on 9090"
+            echo "=== openchamber.log ==="
+            cat openchamber.log || true
+            exit 1
+          fi
           
           if [[ "${{ github.event.inputs.tunnel_provider }}" == "tailscale" ]]; then
             echo "Using Tailscale Funnel..."
@@ -394,24 +357,6 @@ jobs:
             URL=$(tailscale funnel status 2>/dev/null | grep -Eo 'https://[^ ]+' | head -n 1)
             if [ -z "$URL" ]; then
               echo "Could not determine Tailscale Funnel URL"
-              tailscale funnel status || true
-              cat tunnel.log || true
-              exit 1
-            fi
-
-            echo "Waiting for Funnel HTTPS endpoint..."
-            READY=0
-            for i in {1..30}; do
-              if curl -kfsS "$URL" >/dev/null 2>&1; then
-                READY=1
-                echo "Funnel is ready"
-                break
-              fi
-              sleep 2
-            done
-
-            if [ "$READY" -ne 1 ]; then
-              echo "Funnel URL did not become ready in time"
               tailscale funnel status || true
               cat tunnel.log || true
               exit 1
